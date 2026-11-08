@@ -1,0 +1,135 @@
+DATA LOG: OpenSim joint contact forces during treadmill walking, NIH ACL cohort
+=============================================================================
+Files: x-train.csv, y-train.csv, x-test.csv, y-test.csv (comma separated, one header row).
+One row = one stride of the RIGHT leg. Row i of x-*.csv and row i of y-*.csv are the same stride
+(same subject, block, stride_in_block). x = inputs (what a wearable or a gait lab measures), y = outputs
+(what an OpenSim musculoskeletal simulation produces from those inputs). The modelling goal is to predict y from x.
+
+1. WHERE THE DATA COME FROM
+---------------------------
+Cohort: 15 adults with a history of anterior cruciate ligament (ACL) reconstruction (10 women, 5 men;
+mass 56-91 kg; height 1.52-1.83 m), walking on an instrumented treadmill in the NIH ACL study. Each subject
+walked 3 minutes at each of three belt speeds: 1.0, 1.25 and 1.5 m/s (Subject02 walked 1.4 m/s instead of 1.5).
+Motion capture (marker trajectories) and force plates under each belt were recorded together.
+From each 3-minute trial, three 1-minute blocks were taken and 5 consecutive strides were extracted from each
+block, so a trial contributes up to 15 strides and a subject up to 45 (Subject01 and 02 have an extra trial, 50;
+Subject14 has one unusable trial, 30). Total 670 strides from 134 blocks.
+
+Processing (OpenSim 4.6, pipeline by K. Morgan, run unchanged apart from one static-trial fix for Subject12):
+  - Model: Rajagopal 2016 full-body musculoskeletal model (Lai-Uhlrich 2023 update), scaled to each subject
+    from a standing static trial; muscle strength scaled with mass and height (Handsfield 2014).
+  - Inverse Kinematics (IK): joint angles from the marker trajectories.
+  - Residual Reduction (RRA): small adjustments so model kinematics and measured ground reaction forces are
+    dynamically consistent.
+  - Static Optimisation (SO): muscle forces that reproduce the joint moments, minimising the sum of squared
+    activations.
+  - Joint Reaction Analysis (JRA): the force transmitted across each joint, given muscle and external forces.
+  Quality was checked against the Hicks et al. 2015 recommendations (marker errors, residual forces, reserve
+  actuators, muscle saturation). Strides from blocks that failed those checks are EXCLUDED from these files
+  (see section 5).
+
+2. THE GAIT CYCLE GRID (the "_tNNN" suffix)
+-------------------------------------------
+Every curve column is sampled at 101 equally spaced points of the gait cycle, t000 ... t100, where t000 is
+right heel strike and t100 is the next right heel strike (so t100 of one stride is t000 of the next).
+Heel strike and toe-off were detected from the vertical force on the right belt (threshold 20 N, forces
+low-pass filtered at 6 Hz). Time is normalised, not absolute: a stride lasts about 1.1 s on average, and
+stance (foot on the ground) ends at about 62 % of the cycle, swing is the remaining 38 %. Because every stride
+is on the same grid, strides can be averaged, compared and modelled as curves (functional data).
+
+3. COLUMNS COMMON TO ALL FOUR FILES (identifiers and scalar inputs)
+------------------------------------------------------------------
+subject          NIH_ACL_Subject01 ... Subject15. Identifier; NEVER an input to the model (see section 6).
+block            trial and block, e.g. Walking125_b2 = 1.25 m/s trial, block 2 (Walking10 = 1.0 m/s,
+                 Walking15 = 1.5 m/s, Walking14_B14 = 1.4 m/s, Subject02 only). Identifier.
+stride_in_block  1-5, the stride's position within its 5-stride block. Identifier.
+belt_speed_mps   treadmill belt speed in metres per second: 1.0, 1.25, 1.4 or 1.5. A real input.
+mass_kg          body mass in kilograms, measured from the force plates during the static trial. Input.
+height_m         standing height in metres, from the lab sheet. Input.
+
+4. THE CURVE COLUMNS
+--------------------
+4a. Inputs, x-*.csv: 8 curves x 101 points = 808 columns, in this order.
+  grf_vertical_BW_t000..t100         vertical ground reaction force under the right foot, in body weights
+                                      (force / (mass x 9.80665)). ~0 in swing, two humps in stance
+                                      (loading ~1.1 BW near 15 %, push-off near 50 %).
+  grf_anteroposterior_BW_t000..t100  fore-aft ground reaction force, body weights. Positive = forward
+                                      (propulsive); negative = braking. Braking early stance (~-0.17 BW near
+                                      12 %), propulsion late stance (~+0.18 BW near 53 %).
+  grf_mediolateral_BW_t000..t100     side-to-side ground reaction force, body weights, right foot. Negative =
+                                      medial (toward the body midline). Small, about -0.08 BW at most.
+  hip_flexion_deg_t000..t100         right hip flexion angle, degrees. Positive = flexion (thigh forward).
+                                      ~+17 at heel strike, ~-22 (extension) near 53 %, back to +17 in swing.
+  hip_adduction_deg_t000..t100       right hip adduction, degrees. Positive = adduction (thigh toward midline).
+  hip_rotation_deg_t000..t100        right hip axial rotation, degrees. Positive = internal rotation.
+  knee_flexion_deg_t000..t100        right knee flexion, degrees. Positive = flexion. ~4 at heel strike,
+                                      small flexion wave in early stance, ~67 peak in swing near 73 %.
+  ankle_angle_deg_t000..t100         right ankle, degrees. Positive = dorsiflexion (toes up), negative =
+                                      plantarflexion. Dorsiflexion peak ~+12 near 49 %, plantarflexion ~-13
+                                      at push-off/toe-off near 66 %.
+  The GRFs come straight from the force plates (filtered, normalised). The angles are the OpenSim IK output,
+  i.e. they already depend on the scaled model; they are what a gait lab would report as joint kinematics.
+  Angles follow the sign conventions of the Rajagopal model coordinates (hip_flexion_r, hip_adduction_r,
+  hip_rotation_r, knee_angle_r, ankle_angle_r).
+
+4b. Outputs, y-*.csv: 3 curves x 101 points = 303 columns.
+  hip_jcf_BW_t000..t100     right hip joint contact force (resultant), body weights
+  knee_jcf_BW_t000..t100    right knee (tibiofemoral) joint contact force (resultant), body weights
+  ankle_jcf_BW_t000..t100   right ankle (talocrural) joint contact force (resultant), body weights
+  "Joint contact force" (JCF) = the total force pressing the two bones of a joint together: external load plus
+  the compressive effect of all muscles spanning the joint. Muscles are why it is several body weights during
+  walking even though the GRF is about 1 BW. Each value is the MAGNITUDE (Euclidean norm) of the 3-D force vector
+  reported by OpenSim JRA on the child body (femur, tibia, talus) in that body's frame; the three components are
+  not in these files. Typical mean curve: hip peaks 3.6 BW (14 %) and 3.9 BW (49 %); knee 2.9 BW (13 %) and
+  4.0 BW (45 %); ankle 2.7 BW (29 %) and 5.5 BW (49 %); all fall to 0.3-0.6 BW in swing. Across strides the
+  peaks range roughly 3-7 BW (hip, knee) and 4.5-8.5 BW (ankle). These are model-based estimates, not
+  measurements; published instrumented-implant and model values for walking lie in these ranges.
+  The JCFs are a deterministic function of the simulation inputs (kinematics, GRFs, scaled model, muscle
+  model). The GP emulator approximates that function from data so that OpenSim need not be run.
+
+5. WHAT WAS EXCLUDED, AND WHY (science flags)
+---------------------------------------------
+50 of the 670 strides are not in these files because their simulations failed the quality checks:
+  Subject08, 1.5 m/s, all 15 strides: IK failure, shank marker error 44 mm RMS, implausible knee/ankle angles.
+  Subject06, 1.5 m/s, all 15 strides: soleus at 100 % activation on both sides, ankle reserve 34 %, ankle JCF
+                                      9-10 BW (the optimiser could not balance the ankle moment with muscles).
+  Subject10, 1.5 m/s, all 15 strides: soleus and gastrocnemius saturated, ankle JCF 9.4 BW.
+  Subject07, 1.5 m/s block 3, 5 strides: marker spike of 3.5 m, ankle tracking error 15 degrees.
+Note that these are all at the fastest speed, so the files have fewer 1.5 m/s strides (160) than 1.0 (230) or
+1.25 (210) m/s strides. Subject14's 1.25 m/s block 2 file was truncated at 4 s and was never simulated.
+Subject12's static trial had an unlabelled pelvis marker; the pipeline's static-window selection was fixed so
+that it uses a window where every marker is labelled, and Subject12 was re-run. Its right-leg results pass the
+checks and are included.
+
+6. TRAIN / TEST SPLIT: BY SUBJECT, NOT BY STRIDE
+------------------------------------------------
+Train: 12 subjects (02, 04, 05, 06, 07, 08, 09, 10, 11, 13, 14, 15), 480 strides
+       (speeds: 1.0 m/s 180, 1.25 m/s 165, 1.4 m/s 20, 1.5 m/s 115).
+Test:  3 subjects (01, 03, 12), 140 strides (1.0 m/s 50, 1.25 m/s 45, 1.5 m/s 45).
+The three test subjects were drawn at random (numpy default_rng seed 2026) from the 15; every stride of a
+test subject is in the test set and none in the training set.
+Why by subject: the 5 strides of one block, and the 45 strides of one subject, are near-duplicates of each
+other (same person, same speed, consecutive strides). A random split of strides puts near-copies of each test
+stride in the training set, and the model only has to interpolate within a person. We measured this leakage:
+knee RMSE 0.11 BW with a random stride split versus 0.22 BW with the subject split. The scientific question is
+whether JCF can be predicted for a NEW person, so the subject split is the honest one. For model selection,
+use leave-one-subject-out cross-validation within the 12 training subjects; use the 3 test subjects once, at
+the end, to report performance. Never use the subject identifier as a feature.
+The 1.4 m/s speed exists only in training (Subject02), so test predictions at that speed are not evaluated.
+
+7. WHAT TO EXPECT AND HOW TO SCORE
+----------------------------------
+Baselines on the test subjects (RMSE over all 140 x 101 points, body weights): predicting the training mean
+curve of the same speed gives hip 0.42, knee 0.29, ankle 0.38. A space-time Gaussian process on these inputs
+gives about hip 0.29-0.33, knee 0.19-0.23, ankle 0.23-0.26. Most of the remaining error is subject-specific
+and sits in early stance (20-30 % of the cycle), where the inputs do not determine the JCF.
+Report at least: RMSE and MAPE of the curves, error of the peak value, and, for probabilistic models, CRPS
+and the coverage of the 95 % prediction interval (how often the true curve lies inside it; should be 95 %).
+Units: body weights for forces, degrees for angles, percent of gait cycle for time.
+
+8. REFERENCES FOR THE METHODS BEHIND THE DATA
+---------------------------------------------
+Delp et al. 2007 (OpenSim); Rajagopal et al. 2016 (model); Lai, Arnold, Wakeling 2017 and Uhlrich et al. 2022
+(model updates); Hicks et al. 2015 (verification and validation guidelines); Handsfield et al. 2014 (muscle
+volume scaling); Steele et al. 2012 (JCF with OpenSim JRA); Bergmann et al. 2014 and Fregly et al. 2012
+(instrumented implant JCF ranges for validation).
