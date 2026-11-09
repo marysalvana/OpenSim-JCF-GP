@@ -8,8 +8,8 @@ factorization of Salvana (2026).
 
 Differences from the Colab notebook
   * All arithmetic runs in fp64 on the CPU. Apple's MPS GPU backend has no fp64,
-    so the GPU is not used. On the CPU the candidate storage formats are fp16,
-    fp32 and fp64, lowest precision first. fp16 and fp32 are storage formats
+    so the GPU is not used. On the CPU the candidate storage formats are bf16,
+    fp32 and fp64, lowest precision first. bf16 and fp32 are storage formats
     only, and every block is read back to fp64 before it is used.
   * A MacBook has far less memory than an 80 GB A100, so by default the model is
     fitted on a subset of the training strides, chosen with --strides. The full
@@ -155,14 +155,14 @@ class TrivariateMatern:
 
 
 # ----------------------------------------------------------------------------- adaptive block mixed-precision Cholesky factorization
-# Algorithm 1 of Salvana (2026). The precision rung on the Mac is fp16, fp32, fp64. The diagonal
+# Algorithm 1 of Salvana (2026). The precision rung on the Mac is bf16, fp32, fp64. The diagonal
 # blocks are kept in fp64, and each off-diagonal block is stored in the lowest format whose
 # storage error fits the budget b = tau m / nB, where m = min_j eta_j bounds the smallest eigenvalue.
 
 TAU = args.tau
-CANDIDATES = {"fp16": torch.float16, "fp32": torch.float32}       # lowest precision first
-LARGEST = {"fp16": 65504.0, "fp32": 3.40e38}                       # largest finite number of each format
-FORMAT_NAMES = ["fp16", "fp32", "fp64"]
+CANDIDATES = {"bf16": torch.bfloat16, "fp32": torch.float32}      # lowest precision first
+LARGEST = {"bf16": 3.39e38, "fp32": 3.40e38}                       # largest finite number of each format
+FORMAT_NAMES = ["bf16", "fp32", "fp64"]
 
 
 def choose_format(A, budget):
@@ -240,7 +240,7 @@ print(f"number of entries          {N * N:,}")
 print(f"matrix in fp64             {N * N * 8 / 1e9:.2f} GB")
 print(f"Cholesky factor in fp64    {N * (N + 1) / 2 * 8 / 1e9:.2f} GB")
 print(f"Cholesky factor in fp32    {N * (N + 1) / 2 * 4 / 1e9:.2f} GB")
-print(f"Cholesky factor in fp16    {N * (N + 1) / 2 * 2 / 1e9:.2f} GB")
+print(f"Cholesky factor in bf16    {N * (N + 1) / 2 * 2 / 1e9:.2f} GB")
 print(f"blocks                     {nB} x {nB}, each with up to {args.block_size:,} points")
 print(f"precision rung             {' < '.join(FORMAT_NAMES)}, tau = {TAU}")
 if N * (N + 1) / 2 * 8 / 1e9 > 0.5 * RAM_GB:
@@ -314,7 +314,7 @@ pd.DataFrame(p["rho"], index=JOINTS, columns=JOINTS).to_csv(os.path.join(args.ou
 
 # ----------------------------------------------------------------------------- precision assigned to each block
 
-PRECISION_COLORS = {"fp16": "#1FBEC0", "fp32": "#F26F22", "fp64": "#4D4D4D"}     # teal / orange / dark gray
+PRECISION_COLORS = {"bf16": "#1FBEC0", "fp32": "#F26F22", "fp64": "#4D4D4D"}     # teal / orange / dark gray
 
 
 def plot_precision(precision, count, N, block_size, path):
