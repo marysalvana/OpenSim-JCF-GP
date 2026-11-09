@@ -1,25 +1,18 @@
 """
-Trivariate Gaussian process emulation of joint contact forces, Mac version.
+Trivariate Gaussian process emulation of joint contact forces.
 
-Mac port of jcf-gp-trivariate-colab.ipynb. The hip, the knee and the ankle are
-modeled jointly with a trivariate separable space-time Matern model, fitted by
-maximum likelihood with the adaptive block mixed-precision Cholesky
-factorization of Salvana (2026).
+The hip, the knee and the ankle are modeled jointly with a trivariate separable
+space-time Matern model, fitted by maximum likelihood with the adaptive block
+mixed-precision Cholesky factorization of Salvana (2026). All arithmetic runs in
+fp64 on the CPU. The candidate storage formats of the factor blocks are bf16,
+fp32 and fp64, lowest precision first.
 
-Differences from the Colab notebook
-  * All arithmetic runs in fp64 on the CPU. Apple's MPS GPU backend has no fp64,
-    so the GPU is not used. On the CPU the candidate storage formats are bf16,
-    fp32 and fp64, lowest precision first. bf16 and fp32 are storage formats
-    only, and every block is read back to fp64 before it is used.
-  * A MacBook has far less memory than an 80 GB A100, so by default the model is
-    fitted on a subset of the training strides, chosen with --strides. The full
-    set of 480 strides gives N = 145,440 and an fp64 factor of 85 GB, which does
-    not fit on a laptop.
+The model is fitted on a subset of the training strides, chosen with --strides.
+The full set of 480 strides gives N = 145,440 and an fp64 factor of 85 GB.
 
 Usage
   python3 codes/jcf-gp-trivariate-mac.py                       # 48 strides, N = 14,544
   python3 codes/jcf-gp-trivariate-mac.py --strides 96          # N = 29,088
-  python3 codes/jcf-gp-trivariate-mac.py --strides 480         # full data, not for a laptop
 Run from the project root, where data/x-train.csv and data/y-train.csv live.
 """
 
@@ -54,11 +47,10 @@ os.makedirs(args.out, exist_ok=True)
 
 # ----------------------------------------------------------------------------- setup
 
-DEVICE = torch.device("cpu")        # MPS has no fp64, so the Cholesky factorization runs on the CPU
+DEVICE = torch.device("cpu")
 torch.set_default_dtype(torch.float64)
 RAM_GB = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
 print(f"{platform.machine()} Mac, {RAM_GB:.0f} GB unified memory, {torch.get_num_threads()} CPU threads, torch {torch.__version__}")
-print(f"MPS GPU available: {torch.backends.mps.is_available()}, but it has no fp64, so all arithmetic runs on the CPU")
 
 # ----------------------------------------------------------------------------- data
 
@@ -244,11 +236,11 @@ print(f"Cholesky factor in bf16    {N * (N + 1) / 2 * 2 / 1e9:.2f} GB")
 print(f"blocks                     {nB} x {nB}, each with up to {args.block_size:,} points")
 print(f"precision rung             {' < '.join(FORMAT_NAMES)}, tau = {TAU}")
 if N * (N + 1) / 2 * 8 / 1e9 > 0.5 * RAM_GB:
-    print(f"warning: the fp64 factor would exceed half of the {RAM_GB:.0f} GB of memory; use fewer strides if the run is killed")
+    print(f"warning: the fp64 factor would exceed half of the {RAM_GB:.0f} GB of memory; use fewer strides")
 
 # ----------------------------------------------------------------------------- maximum likelihood estimation
 
-# starting values: the univariate estimates of the first notebook (hip, knee, ankle)
+# starting values: the univariate estimates (hip, knee, ankle)
 l0 = np.array([0.354, 0.287, 0.313])                       # input ranges [standardized units]
 lt0 = np.array([5.57, 4.34, 4.46])                         # temporal ranges [% gait cycle]
 var0 = np.array([0.133, 0.072, 0.096]) / scale**2          # variances, standardized
