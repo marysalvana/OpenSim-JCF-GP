@@ -35,8 +35,8 @@ from scipy.optimize import minimize
 
 # ----------------------------------------------------------------------------- arguments
 
-parser = argparse.ArgumentParser(description="Trivariate GP emulator of joint contact forces, fitted on a Mac with a mixed-precision Cholesky factorization.")
-parser.add_argument("--strides", type=int, default=48, help="number of training strides to use, evenly spaced over the 480 (default 48)")
+parser = argparse.ArgumentParser(description="Trivariate Gaussian process emulator of joint contact forces, fitted by maximum likelihood with a mixed-precision Cholesky factorization.")
+parser.add_argument("--strides", type=int, default=48, help="number of training strides, evenly spaced over the 480 (default 48)")
 parser.add_argument("--block-size", type=int, default=512, help="points per block of the factorization (default 512)")
 parser.add_argument("--tau", type=float, default=0.99, help="error-budget parameter, 0 < tau < 1 (default 0.99)")
 parser.add_argument("--max-iterations", type=int, default=60, help="L-BFGS-B iterations (default 60)")
@@ -49,8 +49,8 @@ os.makedirs(args.out, exist_ok=True)
 
 DEVICE = torch.device("cpu")
 torch.set_default_dtype(torch.float64)
-RAM_GB = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
-print(f"{platform.machine()} Mac, {RAM_GB:.0f} GB unified memory, {torch.get_num_threads()} CPU threads, torch {torch.__version__}")
+MEMORY_GB = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+print(f"{platform.machine()}, {MEMORY_GB:.0f} GB memory, {torch.get_num_threads()} CPU threads, torch {torch.__version__}")
 
 # ----------------------------------------------------------------------------- data
 
@@ -147,7 +147,7 @@ class TrivariateMatern:
 
 
 # ----------------------------------------------------------------------------- adaptive block mixed-precision Cholesky factorization
-# Algorithm 1 of Salvana (2026). The precision rung on the Mac is bf16, fp32, fp64. The diagonal
+# Algorithm 1 of Salvana (2026). The precision rung is bf16, fp32, fp64. The diagonal
 # blocks are kept in fp64, and each off-diagonal block is stored in the lowest format whose
 # storage error fits the budget b = tau m / nB, where m = min_j eta_j bounds the smallest eigenvalue.
 
@@ -235,8 +235,8 @@ print(f"Cholesky factor in fp32    {N * (N + 1) / 2 * 4 / 1e9:.2f} GB")
 print(f"Cholesky factor in bf16    {N * (N + 1) / 2 * 2 / 1e9:.2f} GB")
 print(f"blocks                     {nB} x {nB}, each with up to {args.block_size:,} points")
 print(f"precision rung             {' < '.join(FORMAT_NAMES)}, tau = {TAU}")
-if N * (N + 1) / 2 * 8 / 1e9 > 0.5 * RAM_GB:
-    print(f"warning: the fp64 factor would exceed half of the {RAM_GB:.0f} GB of memory; use fewer strides")
+if N * (N + 1) / 2 * 8 / 1e9 > 0.5 * MEMORY_GB:
+    print(f"warning: the fp64 Cholesky factor exceeds half of the {MEMORY_GB:.0f} GB of memory; reduce --strides")
 
 # ----------------------------------------------------------------------------- maximum likelihood estimation
 
@@ -293,7 +293,7 @@ print(shown.to_string())
 print("\ncross-correlations between the joints at the same stride and gait point")
 print(pd.DataFrame(p["rho"], index=JOINTS, columns=JOINTS).round(3).to_string())
 
-peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e9           # bytes on macOS
+peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e9           # ru_maxrss is in bytes on macOS
 summary = pd.Series({"N": f"{N:,}", "blocks": f"{nB} x {nB}",
                      f"off-diagonal blocks in {' / '.join(FORMAT_NAMES)}": " / ".join(str(c) for c in best["count"].values()),
                      "stored Cholesky factor [GB]": f"{best['stored_gb']:.2f}",
@@ -306,7 +306,7 @@ pd.DataFrame(p["rho"], index=JOINTS, columns=JOINTS).to_csv(os.path.join(args.ou
 
 # ----------------------------------------------------------------------------- precision assigned to each block
 
-PRECISION_COLORS = {"bf16": "#1FBEC0", "fp32": "#F26F22", "fp64": "#4D4D4D"}     # teal / orange / dark gray
+PRECISION_COLORS = {"bf16": "#1FBEC0", "fp32": "#F26F22", "fp64": "#4D4D4D"}
 
 
 def plot_precision(precision, count, N, block_size, path):
