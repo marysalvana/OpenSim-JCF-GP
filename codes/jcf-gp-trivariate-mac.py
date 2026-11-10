@@ -1,18 +1,18 @@
 """
 Trivariate Gaussian process emulation of joint contact forces.
 
-The hip, the knee and the ankle are modeled jointly with a trivariate separable
-space-time Matern model, fitted by maximum likelihood with the adaptive block
-mixed-precision Cholesky factorization of Salvana (2026). All arithmetic runs in
-fp64 on the CPU. The candidate storage formats of the factor blocks are bf16,
-fp32 and fp64, lowest precision first.
-
-The model is fitted on a subset of the training strides, chosen with --strides.
-The full set of 480 strides gives N = 145,440 and an fp64 factor of 85 GB.
+The hip, the knee and the ankle are modeled jointly with a trivariate Matern
+model over the stride inputs, fitted by maximum likelihood with the adaptive
+block mixed-precision Cholesky factorization of Salvana (2026). The output of
+each joint is one scalar per stride, by default the peak joint contact force
+over the gait cycle. All arithmetic runs in fp64 on the CPU. The candidate
+storage formats of the factor blocks are bf16, fp32 and fp64, lowest
+precision first.
 
 Usage
-  python3 codes/jcf-gp-trivariate-mac.py                       # 48 strides, N = 14,544
-  python3 codes/jcf-gp-trivariate-mac.py --strides 96          # N = 29,088
+  python3 codes/jcf-gp-trivariate-mac.py                        # peak JCF, all 480 strides, N = 1,440
+  python3 codes/jcf-gp-trivariate-mac.py --target mean          # mean JCF over the gait cycle
+  python3 codes/jcf-gp-trivariate-mac.py --target 25            # JCF at gait point 25
 Run from the project root, where data/x-train.csv and data/y-train.csv live.
 """
 
@@ -35,9 +35,10 @@ from scipy.optimize import minimize
 
 # ----------------------------------------------------------------------------- arguments
 
-parser = argparse.ArgumentParser(description="Trivariate Gaussian process emulator of joint contact forces, fitted by maximum likelihood with a mixed-precision Cholesky factorization.")
-parser.add_argument("--strides", type=int, default=48, help="number of training strides, evenly spaced over the 480 (default 48)")
-parser.add_argument("--block-size", type=int, default=512, help="points per block of the factorization (default 512)")
+parser = argparse.ArgumentParser(description="Trivariate Gaussian process emulator of joint contact forces over the stride inputs, fitted by maximum likelihood with a mixed-precision Cholesky factorization.")
+parser.add_argument("--strides", type=int, default=480, help="number of training strides, evenly spaced over the 480 (default 480)")
+parser.add_argument("--target", default="peak", help="output per joint and stride: peak or mean of the JCF curve, or a gait point 0 to 100 (default peak)")
+parser.add_argument("--block-size", type=int, default=120, help="points per block of the factorization (default 120)")
 parser.add_argument("--tau", type=float, default=0.99, help="error-budget parameter, 0 < tau < 1 (default 0.99)")
 parser.add_argument("--max-iterations", type=int, default=60, help="L-BFGS-B iterations (default 60)")
 parser.add_argument("--data", default="data", help="folder with x-train.csv and y-train.csv (default data)")
@@ -82,12 +83,22 @@ def build_features(x, x_ref):
 
 
 F_train = build_features(x_train, x_train)
-Y_train = np.stack([curve(y_train, f"{joint}_jcf_BW") for joint in JOINTS])      # (3 joints, strides, 101 gait points)
-m_t = Y_train.mean(axis=1)                                                        # mean curve of each joint
-scale = Y_train.std(axis=(1, 2))                                                  # s_j, in BW
-Z_train = (Y_train - m_t[:, None, :]) / scale[:, None, None]                      # standardized residuals
+def target(df, joint):
+    C = curve(df, f"{joint}_jcf_BW")                                              # (strides, 101 gait points), in BW
+    if args.target == "peak":
+        return C.max(axis=1)
+    if args.target == "mean":
+        return C.mean(axis=1)
+    return C[:, int(args.target)]
 
-# ----------------------------------------------------------------------------- trivariate separable space-time Matern model
+
+Y_train = np.stack([target(y_train, joint) for joint in JOINTS])                 # (3 joints, strides), in BW
+mean = Y_train.mean(axis=1)                                                       # mean of each joint
+scale = Y_train.std(axis=1)                                                       # s_j, in BW
+Z_train = (Y_train - mean[:, None]) / scale[:, None]                              # standardized residuals
+TARGET_LABEL = {"peak": "peak JCF", "mean": "mean JCF"}.get(args.target, f"JCF at gait point {args.target}")
+
+# ----------------------------------------------------------------------------- trivariate Matern model
 
 
 def matern(d):
@@ -112,38 +123,35 @@ def pair_ranges(l):
 
 
 class TrivariateMatern:
-    def __init__(self, F, Z, t, block_size):
-        self.n, self.T, self.N = Z.shape[1], Z.shape[2], Z.size
+    def __init__(self, F, Z, block_size):
+        self.n, self.N = Z.shape[1], Z.size
         Ft = torch.tensor(F, dtype=torch.float64, device=DEVICE)
         self.H = torch.cdist(Ft, Ft, compute_mode="donot_use_mm_for_euclid_dist") / F.shape[1]**0.5      # h between strides
-        self.t = torch.tensor(t, dtype=torch.float64, device=DEVICE)
         self.y = torch.tensor(Z.reshape(-1), dtype=torch.float64, device=DEVICE)                          # stacked residuals
         index = torch.arange(self.N, device=DEVICE)
-        self.joint, self.stride, self.time = index // (self.n * self.T), (index // self.T) % self.n, index % self.T
+        self.joint, self.stride = index // self.n, index % self.n
         self.blocks = [slice(a, min(a + block_size, self.N)) for a in range(0, self.N, block_size)]
 
     def set_parameters(self, theta):
-        # theta = log input ranges (3), log temporal ranges (3), correlation angles (3), log variance ratios of knee and ankle (2), log relative nugget effects (3)
-        l, lt = np.exp(theta[0:3]), np.exp(theta[3:6])
-        beta = correlation_matrix(theta[6:9])
-        v = np.concatenate([[1.0], np.exp(theta[9:11])])
-        eta = np.exp(theta[11:14])
+        # theta = log input ranges (3), correlation angles (3), log variance ratios of knee and ankle (2), log relative nugget effects (3)
+        l = np.exp(theta[0:3])
+        beta = correlation_matrix(theta[3:6])
+        v = np.concatenate([[1.0], np.exp(theta[6:8])])
+        eta = np.exp(theta[8:11])
         inverse_l, gamma = pair_ranges(l)
-        inverse_lt, gamma_t = pair_ranges(lt)
-        rho = beta * gamma * gamma_t                                               # cross-correlations at the same stride and gait point
+        rho = beta * gamma                                                         # cross-correlations at the same stride
         as_tensor = lambda a: torch.tensor(a, dtype=torch.float64, device=DEVICE)
         self.amplitude = as_tensor(rho * np.sqrt(np.outer(v, v)))
-        self.inverse_l, self.inverse_lt = as_tensor(inverse_l), as_tensor(inverse_lt)
+        self.inverse_l = as_tensor(inverse_l)
         self.nugget = as_tensor(eta)[self.joint]                                   # relative nugget effect of every point
         self.m = float(eta.min())                                                  # lower bound on the smallest eigenvalue
-        self.parameters = dict(l=l, lt=lt, v=v, eta=eta, rho=rho)
+        self.parameters = dict(l=l, v=v, eta=eta, rho=rho)
 
     def block(self, rows, cols):
         # block of the covariance matrix between two sets of points, without the nugget effect
         pair = (self.joint[rows][:, None], self.joint[cols][None, :])
         h = self.H[self.stride[rows]][:, self.stride[cols]]
-        u = (self.t[self.time[rows]][:, None] - self.t[self.time[cols]][None, :]).abs()
-        return self.amplitude[pair] * matern(h * self.inverse_l[pair]) * matern(u * self.inverse_lt[pair])
+        return self.amplitude[pair] * matern(h * self.inverse_l[pair])
 
 
 # ----------------------------------------------------------------------------- adaptive block mixed-precision Cholesky factorization
@@ -225,14 +233,19 @@ def negative_log_likelihood(theta, model):
 
 # ----------------------------------------------------------------------------- size of the covariance matrix
 
-model = TrivariateMatern(F_train, Z_train, GRID.astype(float), args.block_size)
+def size(n_bytes):
+    return f"{n_bytes / 1e9:.2f} GB" if n_bytes >= 1e9 else f"{n_bytes / 1e6:.1f} MB"
+
+
+model = TrivariateMatern(F_train, Z_train, args.block_size)
 N, nB = model.N, len(model.blocks)
-print(f"covariance matrix          {N:,} x {N:,}   ({len(JOINTS)} joints x {model.n} strides x {model.T} gait points)")
+print(f"output                     {TARGET_LABEL} [BW]")
+print(f"covariance matrix          {N:,} x {N:,}   ({len(JOINTS)} joints x {model.n} strides)")
 print(f"number of entries          {N * N:,}")
-print(f"matrix in fp64             {N * N * 8 / 1e9:.2f} GB")
-print(f"Cholesky factor in fp64    {N * (N + 1) / 2 * 8 / 1e9:.2f} GB")
-print(f"Cholesky factor in fp32    {N * (N + 1) / 2 * 4 / 1e9:.2f} GB")
-print(f"Cholesky factor in bf16    {N * (N + 1) / 2 * 2 / 1e9:.2f} GB")
+print(f"matrix in fp64             {size(N * N * 8)}")
+print(f"Cholesky factor in fp64    {size(N * (N + 1) / 2 * 8)}")
+print(f"Cholesky factor in fp32    {size(N * (N + 1) / 2 * 4)}")
+print(f"Cholesky factor in bf16    {size(N * (N + 1) / 2 * 2)}")
 print(f"blocks                     {nB} x {nB}, each with up to {args.block_size:,} points")
 print(f"precision rung             {' < '.join(FORMAT_NAMES)}, tau = {TAU}")
 if N * (N + 1) / 2 * 8 / 1e9 > 0.5 * MEMORY_GB:
@@ -240,15 +253,14 @@ if N * (N + 1) / 2 * 8 / 1e9 > 0.5 * MEMORY_GB:
 
 # ----------------------------------------------------------------------------- maximum likelihood estimation
 
-# starting values: the univariate estimates (hip, knee, ankle)
+# starting values (hip, knee, ankle): the univariate input ranges, unit variances of the standardized outputs, 1 % nugget effects
 l0 = np.array([0.354, 0.287, 0.313])                       # input ranges [standardized units]
-lt0 = np.array([5.57, 4.34, 4.46])                         # temporal ranges [% gait cycle]
-var0 = np.array([0.133, 0.072, 0.096]) / scale**2          # variances, standardized
-nugget0 = np.array([1.61e-4, 8.92e-5, 4.80e-5]) / scale**2 # nugget effects, standardized
-theta0 = np.concatenate([np.log(l0), np.log(lt0), [0.3, 0.3, 0.3], np.log(var0[1:] / var0[0]), np.log(nugget0 / var0[0])])
-bounds = [(np.log(0.05), np.log(5.0))] * 3 + [(np.log(1.0), np.log(30.0))] * 3 + [(-2.0, 2.0)] * 3 + [(-3.0, 3.0)] * 2 + [(np.log(1e-5), np.log(0.1))] * 3
+var0 = np.array([1.0, 1.0, 1.0])                           # variances, standardized
+nugget0 = np.array([0.01, 0.01, 0.01])                     # nugget effects, standardized
+theta0 = np.concatenate([np.log(l0), [0.3, 0.3, 0.3], np.log(var0[1:] / var0[0]), np.log(nugget0 / var0[0])])
+bounds = [(np.log(0.05), np.log(5.0))] * 3 + [(-2.0, 2.0)] * 3 + [(-3.0, 3.0)] * 2 + [(np.log(1e-5), np.log(0.5))] * 3
 
-tag = f"{model.n}strides"
+tag = f"{args.target}_{model.n}strides"
 CHECKPOINT = os.path.join(args.out, f"trivariate_matern_checkpoint_{tag}.json")
 if os.path.exists(CHECKPOINT):
     theta0 = np.array(json.load(open(CHECKPOINT))["theta"])
@@ -270,35 +282,35 @@ def objective(theta):
         json.dump({"theta": theta.tolist(), "nll": nll}, open(CHECKPOINT, "w"))
     p = model.parameters
     print(f"evaluation {best['evaluations']:4d}  negative log likelihood {nll:13.2f}  blocks {'/'.join(FORMAT_NAMES)} {'/'.join(str(c) for c in count.values())}  [{time.time() - t0:.0f} s]\n"
-          f"      input ranges {np.round(p['l'], 3).tolist()}  temporal ranges {np.round(p['lt'], 2).tolist()}  "
+          f"      input ranges {np.round(p['l'], 3).tolist()}  "
           f"variances [BW²] {np.round(sigma2 * p['v'] * scale**2, 4).tolist()}  nugget effects [BW²] {[f'{x:.2e}' for x in sigma2 * p['eta'] * scale**2]}  "
           f"cross-correlations hip-knee {p['rho'][0, 1]:.3f}, hip-ankle {p['rho'][0, 2]:.3f}, knee-ankle {p['rho'][1, 2]:.3f}", flush=True)
     return nll
 
 
 result = minimize(objective, theta0, method="L-BFGS-B", bounds=bounds, options={"maxiter": args.max_iterations, "eps": 1e-3})
-print(f"{result.message}, {result.nit} iterations, {best['evaluations']} likelihood evaluations, {(time.time() - t_start) / 60:.1f} min")
+print(f"{result.message}, {result.nit} iterations, {best['evaluations']} likelihood evaluations, {time.time() - t_start:.0f} s")
 
 # ----------------------------------------------------------------------------- estimates
 
 model.set_parameters(best["theta"])
 p, sigma2 = model.parameters, best["sigma2"]
-estimates = pd.DataFrame({"input range [standardized units]": p["l"], "temporal range [% gait cycle]": p["lt"],
+estimates = pd.DataFrame({"input range [standardized units]": p["l"],
                           "variance [BW²]": sigma2 * p["v"] * scale**2, "nugget effect [BW²]": sigma2 * p["eta"] * scale**2}, index=JOINTS).T
 estimates.columns.name = "joint"
 shown = estimates.apply(lambda col: col.map("{:.3f}".format))
 shown.loc["nugget effect [BW²]"] = estimates.loc["nugget effect [BW²]"].map("{:.2e}".format)
 print(f"\nnegative log likelihood {best['nll']:,.1f}")
 print(shown.to_string())
-print("\ncross-correlations between the joints at the same stride and gait point")
+print("\ncross-correlations between the joints at the same stride")
 print(pd.DataFrame(p["rho"], index=JOINTS, columns=JOINTS).round(3).to_string())
 
 peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e9           # ru_maxrss is in bytes on macOS
 summary = pd.Series({"N": f"{N:,}", "blocks": f"{nB} x {nB}",
                      f"off-diagonal blocks in {' / '.join(FORMAT_NAMES)}": " / ".join(str(c) for c in best["count"].values()),
-                     "stored Cholesky factor [GB]": f"{best['stored_gb']:.2f}",
-                     "Cholesky factor in fp64 [GB]": f"{N * (N + 1) / 2 * 8 / 1e9:.2f}",
-                     "covariance matrix in fp64 [GB]": f"{N * N * 8 / 1e9:.2f}",
+                     "stored Cholesky factor": size(best['stored_gb'] * 1e9),
+                     "Cholesky factor in fp64": size(N * (N + 1) / 2 * 8),
+                     "covariance matrix in fp64": size(N * N * 8),
                      "peak process memory [GB]": f"{peak_gb:.2f}"}, name="mixed-precision factorization")
 print("\n" + summary.to_frame().to_string())
 estimates.to_csv(os.path.join(args.out, f"trivariate_matern_estimates_{tag}.csv"))
