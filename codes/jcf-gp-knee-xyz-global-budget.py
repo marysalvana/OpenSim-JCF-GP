@@ -82,6 +82,8 @@ parser.add_argument("--tau", type=float, default=0.99, help="error-budget parame
 parser.add_argument("--max-iterations", type=int, default=20, help="L-BFGS-B iterations of the parameter fit when no checkpoint exists (default 20)")
 parser.add_argument("--theta", default=None, help="JSON checkpoint with the parameters; by default one is fitted and saved in --out")
 parser.add_argument("--test-strides", type=int, default=140, help="number of test strides used for the prediction-difference check, 0 to skip (default 140)")
+parser.add_argument("--skip-greedy", action="store_true", help="skip the greedy variant, which at large N spends the budget early and pushes the remaining blocks to fp64")
+parser.add_argument("--plan-fraction", type=float, default=1.0, help="fraction of the global budget the offline plan may use, leaving a margin for the realized costs of the second pass (default 1.0)")
 parser.add_argument("--reference", action="store_true", help="also run an all-fp64 factorization as the reference; without it the offline allocation takes its costs from the run of the per-block rule")
 parser.add_argument("--data", default="data", help="folder with the train and test files (default data)")
 parser.add_argument("--out", default="results/global_budget_spacetime", help="folder for the checkpoint, the tables and the figures (default results/global_budget_spacetime)")
@@ -545,15 +547,16 @@ if args.reference:
     rows.append(row); all_assignments.append(asg)
 row, asg = evaluate("A: per-block budget", PerBlockRule(model.m, nB, n_off), record=None if args.reference else costs)
 rows.append(row); all_assignments.append(asg)
-row, asg = evaluate("B-greedy: global budget", GlobalGreedy(model.m, nB, n_off)); rows.append(row); all_assignments.append(asg)
+if not args.skip_greedy:
+    row, asg = evaluate("B-greedy: global budget", GlobalGreedy(model.m, nB, n_off)); rows.append(row); all_assignments.append(asg)
 row, asg = evaluate("B-paced: global budget", GlobalPaced(model.m, nB, n_off)); rows.append(row); all_assignments.append(asg)
 t_plan = time.time()
-plan, planned_used = plan_optimal(costs, sizes, budget)
+plan, planned_used = plan_optimal(costs, sizes, args.plan_fraction * budget)
 t_plan = time.time() - t_plan
 planned_rule = GlobalPlanned(model.m, nB, n_off, plan)
 row, asg = evaluate("B-optimal: global budget", planned_rule)
 row.update({f"planned_{f}": sum(1 for v in plan.values() if v == f) for f in FORMAT_NAMES}, planned_budget_used_pct=100 * planned_used / budget,
-           fallbacks_in_pass2=planned_rule.fallbacks, planning_time_s=t_plan, costs_from="fp64 reference" if args.reference else "A: per-block budget")
+           fallbacks_in_pass2=planned_rule.fallbacks, planning_time_s=t_plan, plan_fraction=args.plan_fraction, costs_from="fp64 reference" if args.reference else "A: per-block budget")
 rows.append(row); all_assignments.append(asg)
 
 # ----------------------------------------------------------------------------- report
@@ -577,7 +580,7 @@ print(f"\nfp64 factor would be {fp64_bytes / 1e9:.3f} GB as stored ({nB} full di
 print(shown.to_string())
 r = table.loc["B-optimal: global budget"]
 print(f"\nB-optimal plan from the costs recorded in the run of {r['costs_from']}: bf16 / fp32 / fp64 = {int(r['planned_bf16'])} / {int(r['planned_fp32'])} / {int(r['planned_fp64'])}, "
-      f"planned budget use {r['planned_budget_used_pct']:.2f} %, fallbacks in the second pass {int(r['fallbacks_in_pass2'])}, planning {r['planning_time_s']:.1f} s")
+      f"planned budget use {r['planned_budget_used_pct']:.2f} % of a plan limited to {100 * r['plan_fraction']:.0f} % of the budget, fallbacks in the second pass {int(r['fallbacks_in_pass2'])}, planning {r['planning_time_s']:.1f} s")
 if args.verify_dense:
     print("\ndense verification (forms L~ L~^T - Sigma; for checking only)")
     print(table[["dense_frobenius_norm", "global_error_sqrt_sum_d2", "dense_over_tracked", "lambda_min_Sigma", "lambda_min_Sigma_tilde"]].to_string(float_format=lambda v: f"{v:.4e}"))
@@ -591,7 +594,7 @@ print("The guarantee assumes exact fp64 arithmetic and storage; the implementati
 PRECISION_COLORS = {"bf16": "#1FBEC0", "fp32": "#F26F22", "fp64": "#4D4D4D"}
 cmap = ListedColormap([PRECISION_COLORS[f] for f in FORMAT_NAMES]); cmap.set_bad("white")
 norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], cmap.N)
-names = ["A: per-block budget", "B-greedy: global budget", "B-paced: global budget", "B-optimal: global budget"]
+names = [n for n in ["A: per-block budget", "B-greedy: global budget", "B-paced: global budget", "B-optimal: global budget"] if n in results]
 fig, axes = plt.subplots(1, len(names), figsize=(4.6 * len(names), 5.6), constrained_layout=True)
 for ax, name in zip(axes, names):
     r = results[name]
