@@ -41,14 +41,25 @@ ankle_angle_deg_t000 ... t100         right ankle angle, degrees. Positive = dor
 The forces are measured by the force plates. The angles are the joint kinematics computed by OpenSim
 inverse kinematics from the motion-capture markers.
 
-OUTPUT CURVES, y-*.csv (3 curves x 101 points = 303 columns)
------------------------------------------------------------
+OUTPUT CURVES, y-*.csv (12 curves x 101 points = 1212 columns)
+--------------------------------------------------------------
 hip_jcf_BW_t000 ... t100     right hip joint contact force, body weights
 knee_jcf_BW_t000 ... t100    right knee joint contact force, body weights
 ankle_jcf_BW_t000 ... t100   right ankle joint contact force, body weights
 A joint contact force (JCF) is the total force pressing the two bones of a joint together: the external load
 plus the compression from the muscles crossing the joint. It is 3 to 6 body weights in walking. Each value is
 the magnitude of the 3-D force computed by OpenSim (joint reaction analysis), not a measurement.
+
+hip_jcf_fx_BW_t000 ... t100, hip_jcf_fy_BW_..., hip_jcf_fz_BW_...        the three components of the hip JCF
+knee_jcf_fx_BW_t000 ... t100, knee_jcf_fy_BW_..., knee_jcf_fz_BW_...     the three components of the knee JCF
+ankle_jcf_fx_BW_t000 ... t100, ankle_jcf_fy_BW_..., ankle_jcf_fz_BW_...  the three components of the ankle JCF
+The components are the force of the parent body on the child body, expressed in the child-body frame of the
+OpenSim model (femur for the hip, tibia for the knee, talus for the ankle), in body weights. The magnitude
+columns above equal sqrt(fx^2 + fy^2 + fz^2). In the child-body frame y runs along the long axis of the bone,
+so fy is the axial component and is negative in compression; x is anterior-posterior (shear) and z is
+medio-lateral. Typical knee values in walking: fy down to -4 BW, fx down to -1 BW, fz within 0.2 BW.
+The component columns were appended on 2026-11-09 from OpenSim_Batch/gp_data/strides.npz (Y_jcf_xyz),
+matched to each row by subject, block and stride_in_block.
 
 TRAIN / TEST SPLIT
 ------------------
