@@ -1,19 +1,23 @@
 """
-Trivariate Gaussian process emulation of joint contact forces.
+Trivariate Gaussian process emulation of the hip, knee and ankle joint contact forces, with the gait points as replicates.
 
-The hip, the knee and the ankle are modeled jointly with a trivariate Matern
-model over the stride inputs, fitted by maximum likelihood with the adaptive
-block mixed-precision Cholesky factorization of Salvana (2026). The output of
-each joint is one scalar per stride, by default the peak joint contact force
-over the gait cycle. All arithmetic runs in fp64 on the CPU. The candidate
-storage formats of the factor blocks are bf16, fp32 and fp64, lowest
+The hip, the knee and the ankle joint contact forces are modeled jointly with a
+trivariate Matern model over the stride inputs. The 101 gait points of the
+cycle are treated as independent replicates of the same trivariate field, as
+the time points are when a spatial model is fitted to a space-time process, so
+one set of parameters is estimated from all of them. The fit is by maximum
+likelihood with the adaptive block mixed-precision Cholesky factorization of
+Salvana (2026); every evaluation of the likelihood factors one 1,440 x 1,440
+matrix and solves it against the 101 replicate vectors. The fitted model
+predicts the three joint contact force curves of the held-out strides, with
+95 % prediction intervals. All arithmetic runs in fp64 on the CPU. The
+candidate storage formats of the factor blocks are bf16, fp32 and fp64, lowest
 precision first.
 
 Usage
-  python3 codes/jcf-gp-trivariate-mac.py                        # peak JCF, all 480 strides, N = 1,440
-  python3 codes/jcf-gp-trivariate-mac.py --target mean          # mean JCF over the gait cycle
-  python3 codes/jcf-gp-trivariate-mac.py --target 25            # JCF at gait point 25
-Run from the project root, where data/x-train.csv and data/y-train.csv live.
+  python3 codes/jcf-gp-trivariate-mac.py                        # all 101 gait points as replicates, N = 1,440
+  python3 codes/jcf-gp-trivariate-mac.py --step 5               # every fifth gait point as a replicate
+Run from the project root, where data/x-train.csv, y-train.csv, x-test.csv and y-test.csv live.
 """
 
 import argparse
@@ -32,17 +36,18 @@ import torch
 from matplotlib.colors import BoundaryNorm, ListedColormap
 from matplotlib.patches import Patch
 from scipy.optimize import minimize
+from scipy.stats import norm
 
 # ----------------------------------------------------------------------------- arguments
 
-parser = argparse.ArgumentParser(description="Trivariate Gaussian process emulator of joint contact forces over the stride inputs, fitted by maximum likelihood with a mixed-precision Cholesky factorization.")
+parser = argparse.ArgumentParser(description="Trivariate Gaussian process emulator of the hip, knee and ankle joint contact forces, with the gait points as replicates, fitted by maximum likelihood with a mixed-precision Cholesky factorization.")
 parser.add_argument("--strides", type=int, default=480, help="number of training strides, evenly spaced over the 480 (default 480)")
-parser.add_argument("--target", default="peak", help="output per joint and stride: peak or mean of the JCF curve, or a gait point 0 to 100 (default peak)")
+parser.add_argument("--step", type=int, default=1, help="use every step-th gait point as a replicate, 1 for all 101 (default 1)")
 parser.add_argument("--block-size", type=int, default=120, help="points per block of the factorization (default 120)")
 parser.add_argument("--tau", type=float, default=0.99, help="error-budget parameter, 0 < tau < 1 (default 0.99)")
 parser.add_argument("--max-iterations", type=int, default=60, help="L-BFGS-B iterations (default 60)")
-parser.add_argument("--data", default="data", help="folder with x-train.csv and y-train.csv (default data)")
-parser.add_argument("--out", default="results", help="folder for the checkpoint, the estimates and the figure (default results)")
+parser.add_argument("--data", default="data", help="folder with the train and test files (default data)")
+parser.add_argument("--out", default="results", help="folder for the checkpoint, the estimates, the predictions and the figures (default results)")
 args = parser.parse_args()
 os.makedirs(args.out, exist_ok=True)
 
@@ -57,12 +62,15 @@ print(f"{platform.machine()}, {MEMORY_GB:.0f} GB memory, {torch.get_num_threads(
 
 x_train = pd.read_csv(os.path.join(args.data, "x-train.csv"))
 y_train = pd.read_csv(os.path.join(args.data, "y-train.csv"))
+x_test = pd.read_csv(os.path.join(args.data, "x-test.csv"))
+y_test = pd.read_csv(os.path.join(args.data, "y-test.csv"))
 n_all = len(x_train)
 keep = np.unique(np.linspace(0, n_all - 1, min(args.strides, n_all)).round().astype(int))
 x_train, y_train = x_train.iloc[keep].reset_index(drop=True), y_train.iloc[keep].reset_index(drop=True)
-print(f"training strides: {len(keep)} of {n_all}")
+print(f"training strides: {len(keep)} of {n_all}; test strides: {len(x_test)}")
 
 GRID = np.arange(101)
+GAIT_POINTS = GRID[::args.step]
 JOINTS = ["hip", "knee", "ankle"]
 INPUT_CURVES = ["grf_vertical_BW", "grf_anteroposterior_BW", "grf_mediolateral_BW",
                 "hip_flexion_deg", "hip_adduction_deg", "hip_rotation_deg", "knee_flexion_deg", "ankle_angle_deg"]
@@ -83,20 +91,12 @@ def build_features(x, x_ref):
 
 
 F_train = build_features(x_train, x_train)
-def target(df, joint):
-    C = curve(df, f"{joint}_jcf_BW")                                              # (strides, 101 gait points), in BW
-    if args.target == "peak":
-        return C.max(axis=1)
-    if args.target == "mean":
-        return C.mean(axis=1)
-    return C[:, int(args.target)]
-
-
-Y_train = np.stack([target(y_train, joint) for joint in JOINTS])                 # (3 joints, strides), in BW
-mean = Y_train.mean(axis=1)                                                       # mean of each joint
-scale = Y_train.std(axis=1)                                                       # s_j, in BW
-Z_train = (Y_train - mean[:, None]) / scale[:, None]                              # standardized residuals
-TARGET_LABEL = {"peak": "peak JCF", "mean": "mean JCF"}.get(args.target, f"JCF at gait point {args.target}")
+F_test = build_features(x_test, x_train)
+Y_train = np.stack([curve(y_train, f"{j}_jcf_BW") for j in JOINTS])                  # (3 joints, strides, 101 gait points), in BW
+Y_test = np.stack([curve(y_test, f"{j}_jcf_BW") for j in JOINTS])
+mean_t = Y_train.mean(axis=1)                                                          # mean curve of each joint
+scale_t = Y_train.std(axis=1)                                                          # s_j(t), in BW
+Z_train = (Y_train - mean_t[:, None, :]) / scale_t[:, None, :]                         # standardized residuals
 
 # ----------------------------------------------------------------------------- trivariate Matern model
 
@@ -123,14 +123,18 @@ def pair_ranges(l):
 
 
 class TrivariateMatern:
-    def __init__(self, F, Z, block_size):
-        self.n, self.N = Z.shape[1], Z.size
+    def __init__(self, F, n_outputs, block_size):
+        self.n, self.N = F.shape[0], n_outputs * F.shape[0]
         Ft = torch.tensor(F, dtype=torch.float64, device=DEVICE)
         self.H = torch.cdist(Ft, Ft, compute_mode="donot_use_mm_for_euclid_dist") / F.shape[1]**0.5      # h between strides
-        self.y = torch.tensor(Z.reshape(-1), dtype=torch.float64, device=DEVICE)                          # stacked residuals
         index = torch.arange(self.N, device=DEVICE)
         self.joint, self.stride = index // self.n, index % self.n
         self.blocks = [slice(a, min(a + block_size, self.N)) for a in range(0, self.N, block_size)]
+
+    def set_outputs(self, Z):
+        # Z has shape (outputs, strides, replicates); column t of self.y stacks the standardized residuals of replicate t
+        self.T = Z.shape[2]
+        self.y = torch.tensor(Z.reshape(-1, Z.shape[2]), dtype=torch.float64, device=DEVICE)             # (N, replicates)
 
     def set_parameters(self, theta):
         # theta = log input ranges (3), correlation angles (3), log variance ratios of knee and ankle (2), log relative nugget effects (3)
@@ -139,7 +143,7 @@ class TrivariateMatern:
         v = np.concatenate([[1.0], np.exp(theta[6:8])])
         eta = np.exp(theta[8:11])
         inverse_l, gamma = pair_ranges(l)
-        rho = beta * gamma                                                         # cross-correlations at the same stride
+        rho = beta * gamma                                                         # cross-correlations between the joints at the same stride
         as_tensor = lambda a: torch.tensor(a, dtype=torch.float64, device=DEVICE)
         self.amplitude = as_tensor(rho * np.sqrt(np.outer(v, v)))
         self.inverse_l = as_tensor(inverse_l)
@@ -206,8 +210,8 @@ def mixed_precision_cholesky(model):
 
 
 def solve(L, blocks, rhs):
-    # solve (L L^T) x = rhs by block forward and back substitution
-    x, nB = rhs.clone().reshape(-1, 1), len(blocks)
+    # solve (L L^T) x = rhs by block forward and back substitution; rhs is a vector or a matrix with one right-hand side per column
+    x, nB = rhs.clone().reshape(rhs.shape[0], -1), len(blocks)
     for k in range(nB):
         s = x[blocks[k]]
         for j in range(k):
@@ -222,13 +226,14 @@ def solve(L, blocks, rhs):
 
 
 def negative_log_likelihood(theta, model):
+    # Gaussian log likelihood of the replicates, which share the covariance matrix; one factorization, one solve per replicate
     model.set_parameters(theta)
     L, logdet, count, precision = mixed_precision_cholesky(model)
-    alpha = solve(L, model.blocks, model.y)
-    sigma2 = float(model.y @ alpha) / model.N                                      # profiled variance of the hip
+    alpha = solve(L, model.blocks, model.y)                                        # (N, replicates)
+    N, T = model.N, model.T
+    sigma2 = float((model.y * alpha).sum()) / (N * T)                              # profiled variance of the first output
     stored_gb = sum(block.nbytes for block in L.values()) / 1e9
-    N = model.N
-    return 0.5 * (N * np.log(sigma2) + logdet + N + N * np.log(2 * np.pi)), sigma2, count, stored_gb, precision
+    return 0.5 * (N * T * np.log(sigma2) + T * logdet + N * T + N * T * np.log(2 * np.pi)), sigma2, count, stored_gb, precision
 
 
 # ----------------------------------------------------------------------------- size of the covariance matrix
@@ -237,10 +242,10 @@ def size(n_bytes):
     return f"{n_bytes / 1e9:.2f} GB" if n_bytes >= 1e9 else f"{n_bytes / 1e6:.1f} MB"
 
 
-model = TrivariateMatern(F_train, Z_train, args.block_size)
+model = TrivariateMatern(F_train, len(JOINTS), args.block_size)
 N, nB = model.N, len(model.blocks)
-print(f"output                     {TARGET_LABEL} [BW]")
-print(f"covariance matrix          {N:,} x {N:,}   ({len(JOINTS)} joints x {model.n} strides)")
+print(f"output                     hip, knee and ankle JCF [BW] at {len(GAIT_POINTS)} gait points, treated as replicates")
+print(f"covariance matrix          {N:,} x {N:,}   ({len(JOINTS)} joints x {model.n} strides), shared by the {len(GAIT_POINTS)} replicates")
 print(f"number of entries          {N * N:,}")
 print(f"matrix in fp64             {size(N * N * 8)}")
 print(f"Cholesky factor in fp64    {size(N * (N + 1) / 2 * 8)}")
@@ -248,8 +253,6 @@ print(f"Cholesky factor in fp32    {size(N * (N + 1) / 2 * 4)}")
 print(f"Cholesky factor in bf16    {size(N * (N + 1) / 2 * 2)}")
 print(f"blocks                     {nB} x {nB}, each with up to {args.block_size:,} points")
 print(f"precision rung             {' < '.join(FORMAT_NAMES)}, tau = {TAU}")
-if N * (N + 1) / 2 * 8 / 1e9 > 0.5 * MEMORY_GB:
-    print(f"warning: the fp64 Cholesky factor exceeds half of the {MEMORY_GB:.0f} GB of memory; reduce --strides")
 
 # ----------------------------------------------------------------------------- maximum likelihood estimation
 
@@ -260,12 +263,13 @@ nugget0 = np.array([0.01, 0.01, 0.01])                     # nugget effects, sta
 theta0 = np.concatenate([np.log(l0), [0.3, 0.3, 0.3], np.log(var0[1:] / var0[0]), np.log(nugget0 / var0[0])])
 bounds = [(np.log(0.05), np.log(5.0))] * 3 + [(-2.0, 2.0)] * 3 + [(-3.0, 3.0)] * 2 + [(np.log(1e-5), np.log(0.5))] * 3
 
-tag = f"{args.target}_{model.n}strides"
+tag = f"{model.n}strides_{len(GAIT_POINTS)}replicates"
 CHECKPOINT = os.path.join(args.out, f"trivariate_matern_checkpoint_{tag}.json")
 if os.path.exists(CHECKPOINT):
     theta0 = np.array(json.load(open(CHECKPOINT))["theta"])
     print("resuming from", CHECKPOINT)
 
+model.set_outputs(Z_train[:, :, GAIT_POINTS])
 best = {"nll": np.inf, "theta": None, "evaluations": 0}
 t_start = time.time()
 
@@ -281,9 +285,9 @@ def objective(theta):
         best.update(nll=nll, theta=theta.copy(), sigma2=sigma2, count=count, stored_gb=stored_gb, precision=precision)
         json.dump({"theta": theta.tolist(), "nll": nll}, open(CHECKPOINT, "w"))
     p = model.parameters
-    print(f"evaluation {best['evaluations']:4d}  negative log likelihood {nll:13.2f}  blocks {'/'.join(FORMAT_NAMES)} {'/'.join(str(c) for c in count.values())}  [{time.time() - t0:.0f} s]\n"
-          f"      input ranges {np.round(p['l'], 3).tolist()}  "
-          f"variances [BW²] {np.round(sigma2 * p['v'] * scale**2, 4).tolist()}  nugget effects [BW²] {[f'{x:.2e}' for x in sigma2 * p['eta'] * scale**2]}  "
+    print(f"evaluation {best['evaluations']:4d}  negative log likelihood {nll:13.2f}  blocks {'/'.join(FORMAT_NAMES)} {'/'.join(str(c) for c in count.values())}  [{time.time() - t0:.1f} s]\n"
+          f"      input ranges {np.round(p['l'], 3).tolist()}  variances (standardized) {np.round(sigma2 * p['v'], 4).tolist()}  "
+          f"nugget effects (standardized) {[f'{x:.2e}' for x in sigma2 * p['eta']]}  "
           f"cross-correlations hip-knee {p['rho'][0, 1]:.3f}, hip-ankle {p['rho'][0, 2]:.3f}, knee-ankle {p['rho'][1, 2]:.3f}", flush=True)
     return nll
 
@@ -295,28 +299,82 @@ print(f"{result.message}, {result.nit} iterations, {best['evaluations']} likelih
 
 model.set_parameters(best["theta"])
 p, sigma2 = model.parameters, best["sigma2"]
+t_peak = int(np.median(curve(y_train, "knee_jcf_BW").argmax(axis=1)))                  # gait point of the peak knee JCF of the median stride
+t_show = min(GAIT_POINTS, key=lambda t: abs(t - t_peak))
 estimates = pd.DataFrame({"input range [standardized units]": p["l"],
-                          "variance [BW²]": sigma2 * p["v"] * scale**2, "nugget effect [BW²]": sigma2 * p["eta"] * scale**2}, index=JOINTS).T
+                          "variance (standardized)": sigma2 * p["v"], "nugget effect (standardized)": sigma2 * p["eta"],
+                          f"variance at gait point {t_show} [BW²]": sigma2 * p["v"] * scale_t[:, t_show]**2,
+                          f"nugget effect at gait point {t_show} [BW²]": sigma2 * p["eta"] * scale_t[:, t_show]**2}, index=JOINTS).T
 estimates.columns.name = "joint"
-shown = estimates.apply(lambda col: col.map("{:.3f}".format))
-shown.loc["nugget effect [BW²]"] = estimates.loc["nugget effect [BW²]"].map("{:.2e}".format)
-print(f"\nnegative log likelihood {best['nll']:,.1f}")
+shown = estimates.apply(lambda col: col.map("{:.4f}".format))
+for name in estimates.index:
+    if name.startswith("nugget"):
+        shown.loc[name] = estimates.loc[name].map("{:.2e}".format)
+print(f"\nnegative log likelihood {best['nll']:,.1f}   ({len(GAIT_POINTS)} replicates; variances and nugget effects in body weights follow the standard deviation s_j(t) of each gait point)")
 print(shown.to_string())
 print("\ncross-correlations between the joints at the same stride")
 print(pd.DataFrame(p["rho"], index=JOINTS, columns=JOINTS).round(3).to_string())
-
-peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e9           # ru_maxrss is in bytes on macOS
-summary = pd.Series({"N": f"{N:,}", "blocks": f"{nB} x {nB}",
-                     f"off-diagonal blocks in {' / '.join(FORMAT_NAMES)}": " / ".join(str(c) for c in best["count"].values()),
-                     "stored Cholesky factor": size(best['stored_gb'] * 1e9),
-                     "Cholesky factor in fp64": size(N * (N + 1) / 2 * 8),
-                     "covariance matrix in fp64": size(N * N * 8),
-                     "peak process memory [GB]": f"{peak_gb:.2f}"}, name="mixed-precision factorization")
-print("\n" + summary.to_frame().to_string())
 estimates.to_csv(os.path.join(args.out, f"trivariate_matern_estimates_{tag}.csv"))
 pd.DataFrame(p["rho"], index=JOINTS, columns=JOINTS).to_csv(os.path.join(args.out, f"trivariate_matern_cross_correlations_{tag}.csv"))
 
-# ----------------------------------------------------------------------------- precision assigned to each block
+# ----------------------------------------------------------------------------- prediction of the test strides, gait point by gait point
+
+
+def predict(model, L, F_new, sigma2):
+    # predictive mean of the three standardized joint forces of every new stride at every replicate, and their standard deviation,
+    # which is the same at every replicate because the replicates share the covariance matrix
+    Fn = torch.tensor(F_new, dtype=torch.float64, device=DEVICE)
+    Ft = torch.tensor(F_train, dtype=torch.float64, device=DEVICE)
+    h = torch.cdist(Fn, Ft, compute_mode="donot_use_mm_for_euclid_dist") / F_train.shape[1]**0.5    # (new strides, training strides)
+    n_new = Fn.shape[0]
+    rows = torch.arange(n_new * 3, device=DEVICE)
+    new_joint, new_stride = rows // n_new, rows % n_new
+    pair = (new_joint[:, None], model.joint[None, :])
+    K_star = model.amplitude[pair] * matern(h[new_stride][:, model.stride] * model.inverse_l[pair])     # (3 n_new, N)
+    alpha = solve(L, model.blocks, model.y)                                                             # (N, replicates)
+    mean = (K_star @ alpha).reshape(3, n_new, -1)                                                       # (3, new strides, replicates)
+    V = solve(L, model.blocks, K_star.T)                                                                # Sigma^{-1} k_*, (N, 3 n_new)
+    explained = (K_star * V.T).sum(dim=1).reshape(3, n_new)
+    prior = torch.diagonal(model.amplitude)[:, None] + torch.tensor(model.parameters["eta"], device=DEVICE)[:, None]
+    var = sigma2 * (prior - explained)
+    return mean.numpy(), np.sqrt(np.maximum(var.numpy(), 1e-12))
+
+
+model.set_parameters(best["theta"])
+L_fit, _, count_show, precision_show = mixed_precision_cholesky(model)
+z_mean, z_sd = predict(model, L_fit, F_test, best["sigma2"])                           # (3, test strides, replicates) and (3, test strides)
+pred_mean = np.full(Y_test.shape, np.nan)                                               # (3 joints, test strides, 101 gait points), in BW
+pred_sd = np.full(Y_test.shape, np.nan)
+pred_mean[:, :, GAIT_POINTS] = mean_t[:, None, GAIT_POINTS] + scale_t[:, None, GAIT_POINTS] * z_mean
+pred_sd[:, :, GAIT_POINTS] = scale_t[:, None, GAIT_POINTS] * z_sd[:, :, None]
+np.savez_compressed(os.path.join(args.out, f"trivariate_matern_predictions_{tag}.npz"), gait_points=GAIT_POINTS, pred_mean=pred_mean, pred_sd=pred_sd, y_test=Y_test,
+                    subject=x_test["subject"].to_numpy(), block=x_test["block"].to_numpy(), stride_in_block=x_test["stride_in_block"].to_numpy())
+
+
+def crps(y, mu, sd):
+    z = (y - mu) / sd
+    return np.mean(sd * (z * (2 * norm.cdf(z) - 1) + 2 * norm.pdf(z) - 1 / np.sqrt(np.pi)))
+
+
+G = GAIT_POINTS
+inside = np.abs(Y_test[:, :, G] - pred_mean[:, :, G]) <= 1.96 * pred_sd[:, :, G]
+scores = pd.DataFrame({"RMSE [BW]": np.sqrt(np.mean((pred_mean[:, :, G] - Y_test[:, :, G])**2, axis=(1, 2))),
+                       "CRPS [BW]": [crps(Y_test[j][:, G], pred_mean[j][:, G], pred_sd[j][:, G]) for j in range(3)],
+                       "95% coverage [%]": inside.mean(axis=(1, 2)) * 100}, index=JOINTS).T
+scores.columns.name = "joint"
+scores.to_csv(os.path.join(args.out, f"trivariate_matern_scores_{tag}.csv"))
+print(f"\nout-of-sample scores on the {len(x_test)} test strides over {len(G)} gait points")
+print(scores.round(3).to_string())
+
+peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e9           # ru_maxrss is in bytes on macOS
+summary = pd.Series({"N": f"{N:,}", "replicates (gait points)": len(GAIT_POINTS), "blocks": f"{nB} x {nB}",
+                     f"off-diagonal blocks in {' / '.join(FORMAT_NAMES)}": " / ".join(str(c) for c in best["count"].values()),
+                     "stored Cholesky factor": size(best["stored_gb"] * 1e9),
+                     "Cholesky factor in fp64": size(N * (N + 1) / 2 * 8), "covariance matrix in fp64": size(N * N * 8),
+                     "peak process memory [GB]": f"{peak_gb:.2f}"}, name="mixed-precision factorization")
+print("\n" + summary.to_frame().to_string())
+
+# ----------------------------------------------------------------------------- figures
 
 PRECISION_COLORS = {"bf16": "#1FBEC0", "fp32": "#F26F22", "fp64": "#4D4D4D"}
 
@@ -335,6 +393,35 @@ def plot_precision(precision, count, N, block_size, path):
     plt.close(fig)
 
 
-figure_path = os.path.join(args.out, f"trivariate_precision_per_block_{tag}.png")
-plot_precision(best["precision"], best["count"], model.N, args.block_size, figure_path)
-print(f"\nfigure saved to {figure_path}")
+def plot_curves(path):
+    # one stride per held-out participant, the one with the median error, for each joint
+    subjects_test = sorted(x_test["subject"].unique())
+    fig, axes = plt.subplots(3, len(subjects_test), figsize=(6 * len(subjects_test), 11), sharex=True)
+    for j, c in enumerate(JOINTS):
+        y, mu, sd = Y_test[j][:, G], pred_mean[j][:, G], pred_sd[j][:, G]
+        for col, s in enumerate(subjects_test):
+            rows = np.where(x_test["subject"].to_numpy() == s)[0]
+            err = np.sqrt(np.mean((mu[rows] - y[rows])**2, axis=1))
+            i = rows[np.argsort(err)[len(err) // 2]]
+            ax = axes[j][col]
+            ax.fill_between(G, mu[i] - 1.96 * sd[i], mu[i] + 1.96 * sd[i], color="#f3c9b0", lw=0, label="95% interval")
+            ax.plot(G, y[i], color="#1f3b5c", lw=2.2, label="OpenSim (Truth)")
+            ax.plot(G, mu[i], color="#D55E00", lw=2.2, ls="--", label="emulator")
+            ax.set_title(f"{c}: {s.replace('NIH_ACL_', '')}, {x_test.loc[i, 'block']}, stride {x_test.loc[i, 'stride_in_block']}, {x_test.loc[i, 'belt_speed_mps']:g} m/s", loc="left", fontsize=10)
+            ax.text(0.98, 0.97, f"RMSE {err[len(err) // 2]:.2f} BW, {np.mean(np.abs(y[i] - mu[i]) <= 1.96 * sd[i]) * 100:.0f}% inside", transform=ax.transAxes, ha="right", va="top", fontsize=9)
+            ax.set_ylim(0, max(y[i].max(), (mu[i] + 1.96 * sd[i]).max()) * 1.3); ax.grid(alpha=0.3)
+            if col == 0:
+                ax.set_ylabel("JCF [BW]")
+            if j == 2:
+                ax.set_xlabel("Gait cycle [%]")
+    axes[0][0].legend(frameon=False, fontsize=9, loc="lower left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+precision_path = os.path.join(args.out, f"trivariate_precision_per_block_{tag}.png")
+plot_precision(precision_show, count_show, N, args.block_size, precision_path)
+curves_path = os.path.join(args.out, f"trivariate_predicted_curves_{tag}.png")
+plot_curves(curves_path)
+print(f"\nfigures saved to {precision_path} and {curves_path}")
