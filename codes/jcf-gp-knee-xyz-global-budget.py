@@ -1,9 +1,21 @@
 """
-Global error-budget allocation for the adaptive block mixed-precision Cholesky factorization.
+Global error-budget allocation for the adaptive block mixed-precision Cholesky factorization, space-time version.
 
-Benchmark on the trivariate Matern emulator of the three knee joint contact force
-components (jcf-gp-knee-xyz-mac.py), at fixed, previously fitted parameters, of
-two precision-assignment rules for the off-diagonal blocks of the Cholesky factor.
+Benchmark on the trivariate separable space-time Matern emulator of the three
+knee joint contact force components over strides and gait points, at fixed
+parameters, of two precision-assignment rules for the off-diagonal blocks of
+the Cholesky factor.
+
+Model. Component j of stride i at gait point t is y_ij(t) = m_j(t) + s_j (f_j(x_i, t) + e_ij(t)),
+with (f_1, f_2, f_3) a trivariate Gaussian process whose covariance between
+(j, x, t) and (k, x', t') is beta_jk sigma_j sigma_k gamma_jk M(h / l_jk) gamma_t,jk M(u / l_t,jk),
+the construction of Gneiting, Kleiber and Schlather (2010) and Apanasovich,
+Genton and Sun (2012) with the Matern 5/2 correlation M, h the root mean
+squared difference of the standardized inputs of two strides and u the lag in
+gait points. The covariance matrix has N = 3 x strides x 101 rows and no
+Kronecker structure because the ranges are component specific. The parameters
+are estimated once by maximum likelihood with the paper's per-block rule, saved
+to a checkpoint, and reused for the comparison.
 
 Method A, the original rule of Salvana (2026). Block (i, k) is stored in the
 lowest format p whose conversion error satisfies
@@ -25,11 +37,11 @@ compared:
              divided equally over the blocks left (unused budget rolls over)
   B-optimal  two passes: a reference fp64 factorization records the cost of
              every format for every block; the blocks are then assigned bf16 in
-             order of increasing cost until the budget is spent, which is the
-             optimal assignment for equal block sizes; the second pass stores
-             the planned formats and re-checks every contribution against the
-             running total, falling back to the next format when the realized
-             cost would exceed the budget.
+             order of increasing cost per byte saved until the budget is spent,
+             which is the optimal assignment for equal block sizes; the second
+             pass stores the planned formats and re-checks every contribution
+             against the running total, falling back to the next format when
+             the realized cost would exceed the budget.
 In every variant a block is accepted only if the running total stays within
 tau^2 m^2, so the induction of Propositions 1 and 2 of the paper applies
 unchanged and the factorization completes, under the assumption of exact fp64
@@ -37,10 +49,10 @@ arithmetic and storage. The implementation runs in finite-precision fp64, whose
 rounding is not covered by the bound.
 
 Usage
-  python3 codes/jcf-gp-knee-xyz-global-budget.py
-  python3 codes/jcf-gp-knee-xyz-global-budget.py --block-size 60 --tau 0.99 --verify-dense
-Run from the project root. Reads the fitted parameters from the checkpoint of
-jcf-gp-knee-xyz-mac.py; writes CSV tables and PNG figures to --out.
+  python3 codes/jcf-gp-knee-xyz-global-budget.py                         # 24 strides, N = 7,272, blocks of 303
+  python3 codes/jcf-gp-knee-xyz-global-budget.py --strides 48            # N = 14,544
+  python3 codes/jcf-gp-knee-xyz-global-budget.py --verify-dense          # also form L~ L~^T - Sigma (small N only)
+Run from the project root; writes the checkpoint, CSV tables and PNG figures to --out.
 """
 
 import argparse
@@ -57,18 +69,20 @@ import pandas as pd
 import torch
 from matplotlib.colors import BoundaryNorm, ListedColormap
 from matplotlib.patches import Patch
+from scipy.optimize import minimize
 
 # ----------------------------------------------------------------------------- arguments
 
-parser = argparse.ArgumentParser(description="Compare the per-block and the global error budget for the mixed-precision Cholesky factorization of the trivariate knee JCF component model.")
+parser = argparse.ArgumentParser(description="Compare the per-block and the global error budget for the mixed-precision Cholesky factorization of the trivariate space-time knee JCF component model.")
 parser.add_argument("--joint", default="knee", choices=["hip", "knee", "ankle"], help="joint whose force components are modeled (default knee)")
-parser.add_argument("--strides", type=int, default=480, help="number of training strides, evenly spaced over the 480 (default 480)")
-parser.add_argument("--step", type=int, default=1, help="use every step-th gait point as a replicate (default 1)")
-parser.add_argument("--block-size", type=int, default=120, help="points per block of the factorization (default 120)")
+parser.add_argument("--strides", type=int, default=24, help="number of training strides, evenly spaced over the 480 (default 24, N = 7,272)")
+parser.add_argument("--block-size", type=int, default=303, help="points per block of the factorization (default 303, three strides of one component)")
 parser.add_argument("--tau", type=float, default=0.99, help="error-budget parameter, 0 < tau < 1 (default 0.99)")
-parser.add_argument("--theta", default=None, help="JSON checkpoint with the fitted parameters (default: the checkpoint of jcf-gp-knee-xyz-mac.py in --out's parent)")
+parser.add_argument("--max-iterations", type=int, default=20, help="L-BFGS-B iterations of the parameter fit when no checkpoint exists (default 20)")
+parser.add_argument("--theta", default=None, help="JSON checkpoint with the parameters; by default one is fitted and saved in --out")
+parser.add_argument("--test-strides", type=int, default=140, help="number of test strides used for the prediction-difference check (default 140)")
 parser.add_argument("--data", default="data", help="folder with the train and test files (default data)")
-parser.add_argument("--out", default="results/global_budget", help="folder for the tables and figures (default results/global_budget)")
+parser.add_argument("--out", default="results/global_budget_spacetime", help="folder for the checkpoint, the tables and the figures (default results/global_budget_spacetime)")
 parser.add_argument("--verify-dense", action="store_true", help="also form the dense perturbation L~ L~^T - Sigma to confirm the tracked error and the smallest eigenvalue (small N only)")
 args = parser.parse_args()
 os.makedirs(args.out, exist_ok=True)
@@ -83,16 +97,14 @@ print(f"{platform.machine()}, {torch.get_num_threads()} CPU threads, torch {torc
 
 x_train = pd.read_csv(os.path.join(args.data, "x-train.csv"))
 y_train = pd.read_csv(os.path.join(args.data, "y-train.csv"))
-x_test = pd.read_csv(os.path.join(args.data, "x-test.csv"))
-y_test = pd.read_csv(os.path.join(args.data, "y-test.csv"))
+x_test = pd.read_csv(os.path.join(args.data, "x-test.csv")).iloc[:args.test_strides].reset_index(drop=True)
+y_test = pd.read_csv(os.path.join(args.data, "y-test.csv")).iloc[:args.test_strides].reset_index(drop=True)
 n_all = len(x_train)
 keep = np.unique(np.linspace(0, n_all - 1, min(args.strides, n_all)).round().astype(int))
 x_train, y_train = x_train.iloc[keep].reset_index(drop=True), y_train.iloc[keep].reset_index(drop=True)
 
 GRID = np.arange(101)
-GAIT_POINTS = GRID[::args.step]
 COMPONENTS = ["fx", "fy", "fz"]
-COMPONENT_LABELS = {"fx": "anterior-posterior", "fy": "axial", "fz": "medio-lateral"}
 INPUT_CURVES = ["grf_vertical_BW", "grf_anteroposterior_BW", "grf_mediolateral_BW",
                 "hip_flexion_deg", "hip_adduction_deg", "hip_rotation_deg", "knee_flexion_deg", "ankle_angle_deg"]
 
@@ -116,10 +128,11 @@ F_test = build_features(x_test, x_train)
 Y_train = np.stack([curve(y_train, f"{args.joint}_jcf_{c}_BW") for c in COMPONENTS])     # (3 components, strides, 101 gait points), in BW
 Y_test = np.stack([curve(y_test, f"{args.joint}_jcf_{c}_BW") for c in COMPONENTS])
 mean_t = Y_train.mean(axis=1)                                                          # mean curve of each component
-scale_t = Y_train.std(axis=1)                                                          # s_j(t), in BW
-Z_train = (Y_train - mean_t[:, None, :]) / scale_t[:, None, :]                         # standardized residuals
+scale = Y_train.std(axis=(1, 2))                                                       # s_j, in BW
+Z_train = (Y_train - mean_t[:, None, :]) / scale[:, None, None]                        # standardized residuals
 
-# ----------------------------------------------------------------------------- trivariate Matern model
+# ----------------------------------------------------------------------------- trivariate separable space-time Matern model
+
 
 def matern(d):
     s = 5.0**0.5 * d
@@ -142,40 +155,52 @@ def pair_ranges(l):
     return inverse, (np.sqrt(a2[:, None] * a2[None, :]) / inverse**2) ** 2.5
 
 
-class TrivariateMatern:
-    def __init__(self, F, n_outputs, block_size):
-        self.n, self.N = F.shape[0], n_outputs * F.shape[0]
+class SpaceTimeTrivariateMatern:
+    def __init__(self, F, Z, t, block_size):
+        self.n, self.T, self.N = Z.shape[1], Z.shape[2], Z.size
         Ft = torch.tensor(F, dtype=torch.float64, device=DEVICE)
+        self.F = Ft
         self.H = torch.cdist(Ft, Ft, compute_mode="donot_use_mm_for_euclid_dist") / F.shape[1]**0.5      # h between strides
+        self.t = torch.tensor(t, dtype=torch.float64, device=DEVICE)
+        self.y = torch.tensor(Z.reshape(-1), dtype=torch.float64, device=DEVICE)                          # stacked residuals
         index = torch.arange(self.N, device=DEVICE)
-        self.component, self.stride = index // self.n, index % self.n
+        self.component, self.stride, self.time = index // (self.n * self.T), (index // self.T) % self.n, index % self.T
         self.blocks = [slice(a, min(a + block_size, self.N)) for a in range(0, self.N, block_size)]
 
-    def set_outputs(self, Z):
-        # Z has shape (outputs, strides, replicates); column t of self.y stacks the standardized residuals of replicate t
-        self.T = Z.shape[2]
-        self.y = torch.tensor(Z.reshape(-1, Z.shape[2]), dtype=torch.float64, device=DEVICE)             # (N, replicates)
-
     def set_parameters(self, theta):
-        # theta = log input ranges (3), correlation angles (3), log variance ratios of fy and fz (2), log relative nugget effects (3)
-        l = np.exp(theta[0:3])
-        beta = correlation_matrix(theta[3:6])
-        v = np.concatenate([[1.0], np.exp(theta[6:8])])
-        eta = np.exp(theta[8:11])
+        # theta = log input ranges (3), log temporal ranges (3), correlation angles (3), log variance ratios of fy and fz (2), log relative nugget effects (3)
+        l, lt = np.exp(theta[0:3]), np.exp(theta[3:6])
+        beta = correlation_matrix(theta[6:9])
+        v = np.concatenate([[1.0], np.exp(theta[9:11])])
+        eta = np.exp(theta[11:14])
         inverse_l, gamma = pair_ranges(l)
-        rho = beta * gamma                                                         # cross-correlations between the components at the same stride
+        inverse_lt, gamma_t = pair_ranges(lt)
+        rho = beta * gamma * gamma_t                                               # cross-correlations at the same stride and gait point
         as_tensor = lambda a: torch.tensor(a, dtype=torch.float64, device=DEVICE)
         self.amplitude = as_tensor(rho * np.sqrt(np.outer(v, v)))
-        self.inverse_l = as_tensor(inverse_l)
+        self.inverse_l, self.inverse_lt = as_tensor(inverse_l), as_tensor(inverse_lt)
         self.nugget = as_tensor(eta)[self.component]                               # relative nugget effect of every point
         self.m = float(eta.min())                                                  # lower bound on the smallest eigenvalue
-        self.parameters = dict(l=l, v=v, eta=eta, rho=rho)
+        self.parameters = dict(l=l, lt=lt, v=v, eta=eta, rho=rho)
 
     def block(self, rows, cols):
         # block of the covariance matrix between two sets of points, without the nugget effect
         pair = (self.component[rows][:, None], self.component[cols][None, :])
         h = self.H[self.stride[rows]][:, self.stride[cols]]
-        return self.amplitude[pair] * matern(h * self.inverse_l[pair])
+        u = (self.t[self.time[rows]][:, None] - self.t[self.time[cols]][None, :]).abs()
+        return self.amplitude[pair] * matern(h * self.inverse_l[pair]) * matern(u * self.inverse_lt[pair])
+
+    def cross(self, F_new, rows_train):
+        # covariance between every (component, new stride, gait point) and the training points in rows_train, without the nugget effect
+        Fn = torch.tensor(F_new, dtype=torch.float64, device=DEVICE)
+        h_new = torch.cdist(Fn, self.F, compute_mode="donot_use_mm_for_euclid_dist") / self.F.shape[1]**0.5    # (new strides, training strides)
+        n_new = Fn.shape[0]
+        idx = torch.arange(3 * n_new * self.T, device=DEVICE)
+        c, s, t = idx // (n_new * self.T), (idx // self.T) % n_new, idx % self.T
+        pair = (c[:, None], self.component[rows_train][None, :])
+        h = h_new[s][:, self.stride[rows_train]]
+        u = (self.t[t][:, None] - self.t[self.time[rows_train]][None, :]).abs()
+        return self.amplitude[pair] * matern(h * self.inverse_l[pair]) * matern(u * self.inverse_lt[pair])
 
 
 # ----------------------------------------------------------------------------- storage formats and the two error budgets
@@ -374,32 +399,29 @@ def negative_log_likelihood(theta, model):
 
 
 def negative_log_likelihood_from_factor(model, result):
-    # the replicate likelihood evaluated with a given factor
+    # the profiled Gaussian log likelihood of the stacked residuals, evaluated with a given factor
     alpha = solve(result["L"], model.blocks, model.y)
-    N, T = model.N, model.T
-    sigma2 = float((model.y * alpha).sum()) / (N * T)
-    return 0.5 * (N * T * np.log(sigma2) + T * result["logdet"] + N * T + N * T * np.log(2 * np.pi)), sigma2
+    N = model.N
+    sigma2 = float(model.y @ alpha) / N
+    return 0.5 * (N * np.log(sigma2) + result["logdet"] + N + N * np.log(2 * np.pi)), sigma2
 
 
-def predict(model, L, F_new, sigma2):
-    # predictive mean of the three standardized components of every new stride at every replicate, and their standard deviation,
-    # which is the same at every replicate because the replicates share the covariance matrix
-    Fn = torch.tensor(F_new, dtype=torch.float64, device=DEVICE)
-    Ft = torch.tensor(F_train, dtype=torch.float64, device=DEVICE)
-    h = torch.cdist(Fn, Ft, compute_mode="donot_use_mm_for_euclid_dist") / F_train.shape[1]**0.5    # (new strides, training strides)
-    n_new = Fn.shape[0]
-    rows = torch.arange(n_new * 3, device=DEVICE)
-    new_component, new_stride = rows // n_new, rows % n_new
-    pair = (new_component[:, None], model.component[None, :])
-    K_star = model.amplitude[pair] * matern(h[new_stride][:, model.stride] * model.inverse_l[pair])     # (3 n_new, N)
-    alpha = solve(L, model.blocks, model.y)                                                             # (N, replicates)
-    mean = (K_star @ alpha).reshape(3, n_new, -1)                                                       # (3, new strides, replicates)
-    V = solve(L, model.blocks, K_star.T)                                                                # Sigma^{-1} k_*, (N, 3 n_new)
-    explained = (K_star * V.T).sum(dim=1).reshape(3, n_new)
-    prior = torch.diagonal(model.amplitude)[:, None] + torch.tensor(model.parameters["eta"], device=DEVICE)[:, None]
-    var = sigma2 * (prior - explained)
-    return mean.numpy(), np.sqrt(np.maximum(var.numpy(), 1e-12))
-
+def predict(model, L, F_new, sigma2, chunk=8):
+    # predictive mean and standard deviation of the three standardized component curves of every new stride, in chunks of strides
+    alpha = solve(L, model.blocks, model.y)
+    all_rows = torch.arange(model.N, device=DEVICE)
+    means, sds = [], []
+    eta = torch.tensor(model.parameters["eta"], device=DEVICE)
+    for a in range(0, F_new.shape[0], chunk):
+        K_star = model.cross(F_new[a:a + chunk], all_rows)                                                 # (3 n_chunk 101, N)
+        n_chunk = min(chunk, F_new.shape[0] - a)
+        mean = (K_star @ alpha).reshape(3, n_chunk, model.T)
+        V = solve(L, model.blocks, K_star.T)                                                                # (N, 3 n_chunk 101)
+        explained = (K_star * V.T).sum(dim=1).reshape(3, n_chunk, model.T)
+        prior = (torch.diagonal(model.amplitude) + eta)[:, None, None]
+        var = sigma2 * (prior - explained)
+        means.append(mean.numpy()); sds.append(np.sqrt(np.maximum(var.numpy(), 1e-12)))
+    return np.concatenate(means, axis=1), np.concatenate(sds, axis=1)
 
 
 def dense_check(model, result):
@@ -414,26 +436,58 @@ def dense_check(model, result):
     return float(torch.linalg.norm(Delta)), float(torch.linalg.eigvalsh(Sigma)[0]), float(torch.linalg.eigvalsh(Lt @ Lt.T)[0])
 
 
-# ----------------------------------------------------------------------------- model at the fitted parameters
+# ----------------------------------------------------------------------------- model, and its parameters by maximum likelihood with the paper's rule
 
-model = TrivariateMatern(F_train, len(COMPONENTS), args.block_size)
-model.set_outputs(Z_train[:, :, GAIT_POINTS])
-theta_path = args.theta or os.path.join(os.path.dirname(args.out.rstrip("/")) or ".", f"trivariate_matern_components_checkpoint_{args.joint}_xyz_{model.n}strides_{len(GAIT_POINTS)}replicates.json")
-if os.path.exists(theta_path):
-    theta = np.array(json.load(open(theta_path))["theta"])
-    print(f"fitted parameters from {theta_path}")
-else:
-    l0 = np.full(3, {"hip": 0.354, "knee": 0.287, "ankle": 0.313}[args.joint])
-    theta = np.concatenate([np.log(l0), [0.3, 0.3, 0.3], [0.0, 0.0], np.log([0.01, 0.01, 0.01])])
-    print(f"no checkpoint at {theta_path}; using the starting values of the fit")
-model.set_parameters(theta)
+model = SpaceTimeTrivariateMatern(F_train, Z_train, GRID.astype(float), args.block_size)
 N, nB = model.N, len(model.blocks)
 n_off = nB * (nB - 1) // 2
 sizes = {(i, k): (model.blocks[i].stop - model.blocks[i].start) * (model.blocks[k].stop - model.blocks[k].start) for k in range(nB) for i in range(k + 1, nB)}
-p = model.parameters
-print(f"covariance matrix          {N:,} x {N:,}   (1 joint x {len(COMPONENTS)} components x {model.n} strides), {len(GAIT_POINTS)} replicates")
+print(f"covariance matrix          {N:,} x {N:,}   (1 joint x {len(COMPONENTS)} components x {model.n} strides x {model.T} gait points)")
+print(f"matrix in fp64             {N * N * 8 / 1e9:.2f} GB, Cholesky factor in fp64 {N * (N + 1) / 2 * 8 / 1e9:.2f} GB")
 print(f"blocks                     {nB} x {nB} of up to {args.block_size} points, {n_off} off-diagonal factor blocks")
-print(f"input ranges               {np.round(p['l'], 3).tolist()}   relative nugget effects {[f'{x:.2e}' for x in p['eta']]}   m = {model.m:.3e}")
+
+theta_path = args.theta or os.path.join(args.out, f"spacetime_checkpoint_{args.joint}_xyz_{model.n}strides.json")
+if os.path.exists(theta_path):
+    theta = np.array(json.load(open(theta_path))["theta"])
+    print(f"parameters from {theta_path}")
+else:
+    # starting values (fx, fy, fz): the univariate knee input and temporal ranges, unit variance ratios, 0.1 % nugget effects
+    l0 = np.full(3, {"hip": 0.354, "knee": 0.287, "ankle": 0.313}[args.joint])
+    lt0 = np.full(3, {"hip": 5.57, "knee": 4.34, "ankle": 4.46}[args.joint])
+    theta0 = np.concatenate([np.log(l0), np.log(lt0), [0.3, 0.3, 0.3], [0.0, 0.0], np.log([1e-3, 1e-3, 1e-3])])
+    bounds = [(np.log(0.05), np.log(5.0))] * 3 + [(np.log(1.0), np.log(30.0))] * 3 + [(-2.0, 2.0)] * 3 + [(-3.0, 3.0)] * 2 + [(np.log(1e-5), np.log(0.1))] * 3
+    best = {"nll": np.inf, "theta": None, "evaluations": 0}
+    rule_A = lambda: PerBlockRule(model.m, nB, n_off)
+    print(f"fitting the parameters with the per-block rule, at most {args.max_iterations} L-BFGS-B iterations", flush=True)
+    t_fit = time.time()
+
+    def objective(th):
+        if best["theta"] is not None and np.max(np.abs(th - best["theta"])) > 0.7:
+            return best["nll"] + 1e6 * float(np.max(np.abs(th - best["theta"])))
+        t0 = time.time()
+        model.set_parameters(th)
+        r = mixed_precision_cholesky(model, rule_A())
+        if r["failure"] is not None:
+            return 1e30
+        nll, sigma2 = negative_log_likelihood_from_factor(model, r)
+        best["evaluations"] += 1
+        if nll < best["nll"]:
+            best.update(nll=nll, theta=th.copy())
+            json.dump({"theta": th.tolist(), "nll": nll}, open(theta_path, "w"))
+        p = model.parameters
+        print(f"evaluation {best['evaluations']:4d}  negative log likelihood {nll:13.2f}  blocks {'/'.join(FORMAT_NAMES)} {'/'.join(str(c) for c in r['count'].values())}  [{time.time() - t0:.1f} s]\n"
+              f"      input ranges {np.round(p['l'], 3).tolist()}  temporal ranges {np.round(p['lt'], 2).tolist()}  variances (standardized) {np.round(sigma2 * p['v'], 4).tolist()}  "
+              f"nugget effects (standardized) {[f'{x:.2e}' for x in sigma2 * p['eta']]}  cross-correlations fx-fy {p['rho'][0, 1]:.3f}, fx-fz {p['rho'][0, 2]:.3f}, fy-fz {p['rho'][1, 2]:.3f}", flush=True)
+        return nll
+
+    result = minimize(objective, theta0, method="L-BFGS-B", bounds=bounds, options={"maxiter": args.max_iterations, "eps": 1e-3})
+    print(f"{result.message}, {result.nit} iterations, {best['evaluations']} likelihood evaluations, {(time.time() - t_fit) / 60:.1f} min; checkpoint {theta_path}")
+    theta = best["theta"]
+
+model.set_parameters(theta)
+p = model.parameters
+print(f"input ranges               {np.round(p['l'], 3).tolist()}   temporal ranges {np.round(p['lt'], 2).tolist()}   relative nugget effects {[f'{x:.2e}' for x in p['eta']]}   m = {model.m:.3e}")
+print(f"cross-correlations         fx-fy {p['rho'][0, 1]:.3f}, fx-fz {p['rho'][0, 2]:.3f}, fy-fz {p['rho'][1, 2]:.3f}")
 print(f"per-block budget           b = tau m / n_B = {TAU * model.m / nB:.3e}")
 print(f"global budget              tau^2 m^2 = {(TAU * model.m)**2:.3e}   (tau m = {TAU * model.m:.3e})")
 
@@ -460,14 +514,14 @@ results["B-optimal: global budget"]["time_pass1"] = results["fp64 reference"]["t
 
 fp64_bytes = results["fp64 reference"]["bytes"]                                  # the same blocks, all stored in fp64 (diagonal blocks as full squares)
 ref_nll, ref_sigma2 = negative_log_likelihood_from_factor(model, results["fp64 reference"])
-ref_mean, ref_sd = predict(model, results["fp64 reference"]["L"], F_test, ref_sigma2)
+ref_mean, ref_sd = predict(model, results["fp64 reference"]["L"], F_test, ref_sigma2)                  # (3, test strides, 101), standardized
 budget = (TAU * model.m)**2
 rows = []
 for name, r in results.items():
     nll, sigma2 = negative_log_likelihood_from_factor(model, r) if r["failure"] is None else (np.nan, np.nan)
     if r["failure"] is None:
         mean, sd = predict(model, r["L"], F_test, sigma2)
-        pred_diff = float(np.max(np.abs(scale_t[:, None, GAIT_POINTS] * (mean - ref_mean))))
+        pred_diff = float(np.max(np.abs(scale[:, None, None] * (mean - ref_mean))))
     else:
         pred_diff = np.nan
     row = {"method": name, "completed": r["failure"] is None, "failure": r["failure"] or "",
@@ -528,7 +582,7 @@ for ax, name in zip(axes, names):
     ax.set_xlabel("block column $k$")
 axes[0].set_ylabel("block row $i$")
 fig.legend(handles=[Patch(facecolor=PRECISION_COLORS[f], label=f) for f in FORMAT_NAMES], loc="lower center", ncol=3, frameon=False, bbox_to_anchor=(0.5, -0.08))
-fig.suptitle(f"Storage precision of the off-diagonal factor blocks under the per-block and the global error budget\n($N$ = {N:,}, $n_b$ = {args.block_size}, {nB} $\\times$ {nB} blocks, $\\tau$ = {TAU}, diagonal blocks fp64)", fontsize=12, y=1.1)
+fig.suptitle(f"Storage precision of the off-diagonal factor blocks under the per-block and the global error budget, space-time model\n($N$ = {N:,} = 3 components $\\times$ {model.n} strides $\\times$ {model.T} gait points, $n_b$ = {args.block_size}, {nB} $\\times$ {nB} blocks, $\\tau$ = {TAU}, diagonal blocks fp64)", fontsize=12, y=1.1)
 fig.savefig(os.path.join(args.out, "mixed_precision_budget_precision_maps.png"), dpi=200, bbox_inches="tight")
 plt.close(fig)
 
