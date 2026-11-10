@@ -1,0 +1,16 @@
+,A: per-block budget,B-paced: global budget,B-optimal: global budget,"C: inference-driven, eps=1e-05",D: fp64 reference
+bf16 blocks [%],0.0,3.3,10.9,0.0,0.0
+fp32 blocks [%],100.0,96.7,89.1,89.9,0.0
+fp64 blocks [%],0.0,0.0,0.0,10.1,100.0
+total factor storage,118.98 MB,117.33 MB,113.48 MB,129.27 MB,220.34 MB
+storage reduction vs fp64 [%],46.0,46.8,48.5,41.3,0.0
+storage reduction vs original [%],0.0,1.4,4.6,-8.6,-85.2
+negative log likelihood,"-14,958.665","-14,958.664","-14,958.658","-14,958.665","-14,958.665"
+likelihood difference vs fp64,-0.0000,+0.0015,+0.0076,-0.0000,+0.0000
+numerical budget utilization [%],0.00,15.55,87.14,0.00,0.00
+numerical error / (tau m),0.0064,0.3943,0.9335,0.0018,0.0000
+statistical sensitivity sum s,7.110e-06,2.533e-04,1.072e-03,2.143e-06,0.000e+00
+statistical budget utilization [%],,,,21.43,
+factorization time [s],1.61,1.54,1.63,1.57,1.40
+of which selection overhead [s],0.38,0.36,0.38,0.37,0.33
+completed,yes,yes,yes,yes,yes
