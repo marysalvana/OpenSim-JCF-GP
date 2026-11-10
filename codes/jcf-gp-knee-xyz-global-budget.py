@@ -35,8 +35,9 @@ compared:
   B-greedy   first feasible format, blocks in factorization order
   B-paced    the lowest format whose contribution is within the budget left,
              divided equally over the blocks left (unused budget rolls over)
-  B-optimal  two passes: a reference fp64 factorization records the cost of
-             every format for every block; the blocks are then assigned bf16 in
+  B-optimal  two passes: a first factorization (the run of the per-block
+             rule, or an all-fp64 reference with --reference) records the
+             cost of every format for every block; the blocks are then assigned bf16 in
              order of increasing cost per byte saved until the budget is spent,
              which is the optimal assignment for equal block sizes; the second
              pass stores the planned formats and re-checks every contribution
@@ -80,7 +81,8 @@ parser.add_argument("--block-size", type=int, default=303, help="points per bloc
 parser.add_argument("--tau", type=float, default=0.99, help="error-budget parameter, 0 < tau < 1 (default 0.99)")
 parser.add_argument("--max-iterations", type=int, default=20, help="L-BFGS-B iterations of the parameter fit when no checkpoint exists (default 20)")
 parser.add_argument("--theta", default=None, help="JSON checkpoint with the parameters; by default one is fitted and saved in --out")
-parser.add_argument("--test-strides", type=int, default=140, help="number of test strides used for the prediction-difference check (default 140)")
+parser.add_argument("--test-strides", type=int, default=140, help="number of test strides used for the prediction-difference check, 0 to skip (default 140)")
+parser.add_argument("--reference", action="store_true", help="also run an all-fp64 factorization as the reference; without it the offline allocation takes its costs from the run of the per-block rule")
 parser.add_argument("--data", default="data", help="folder with the train and test files (default data)")
 parser.add_argument("--out", default="results/global_budget_spacetime", help="folder for the checkpoint, the tables and the figures (default results/global_budget_spacetime)")
 parser.add_argument("--verify-dense", action="store_true", help="also form the dense perturbation L~ L~^T - Sigma to confirm the tracked error and the smallest eigenvalue (small N only)")
@@ -97,8 +99,8 @@ print(f"{platform.machine()}, {torch.get_num_threads()} CPU threads, torch {torc
 
 x_train = pd.read_csv(os.path.join(args.data, "x-train.csv"))
 y_train = pd.read_csv(os.path.join(args.data, "y-train.csv"))
-x_test = pd.read_csv(os.path.join(args.data, "x-test.csv")).iloc[:args.test_strides].reset_index(drop=True)
-y_test = pd.read_csv(os.path.join(args.data, "y-test.csv")).iloc[:args.test_strides].reset_index(drop=True)
+x_test = pd.read_csv(os.path.join(args.data, "x-test.csv")).iloc[:max(args.test_strides, 1)].reset_index(drop=True)
+y_test = pd.read_csv(os.path.join(args.data, "y-test.csv")).iloc[:max(args.test_strides, 1)].reset_index(drop=True)
 n_all = len(x_train)
 keep = np.unique(np.linspace(0, n_all - 1, min(args.strides, n_all)).round().astype(int))
 x_train, y_train = x_train.iloc[keep].reset_index(drop=True), y_train.iloc[keep].reset_index(drop=True)
@@ -491,80 +493,96 @@ print(f"cross-correlations         fx-fy {p['rho'][0, 1]:.3f}, fx-fz {p['rho'][0
 print(f"per-block budget           b = tau m / n_B = {TAU * model.m / nB:.3e}")
 print(f"global budget              tau^2 m^2 = {(TAU * model.m)**2:.3e}   (tau m = {TAU * model.m:.3e})")
 
-# ----------------------------------------------------------------------------- run the methods
+# ----------------------------------------------------------------------------- run the methods, one factor in memory at a time
 
-results = {}
-reference_costs = {}
-t = time.time()
-results["fp64 reference"] = mixed_precision_cholesky(model, type("AllFp64", (), {"name": "fp64", "choose": staticmethod(lambda i, k, err, d2, finite, norm_kk: "fp64")})(), record=reference_costs)
-results["A: per-block budget"] = mixed_precision_cholesky(model, PerBlockRule(model.m, nB, n_off))
-results["B-greedy: global budget"] = mixed_precision_cholesky(model, GlobalGreedy(model.m, nB, n_off))
-results["B-paced: global budget"] = mixed_precision_cholesky(model, GlobalPaced(model.m, nB, n_off))
+import gc
+
+budget = (TAU * model.m)**2
+all_block_entries = sum(sizes.values()) + sum((model.blocks[k].stop - model.blocks[k].start)**2 for k in range(nB))
+fp64_bytes = all_block_entries * 8                                                  # the same blocks, all stored in fp64 (diagonal blocks as full squares)
+results, rows = {}, []
+baseline = {}
+
+
+def evaluate(name, rule, record=None):
+    # factor, score, and keep only what the report needs
+    r = mixed_precision_cholesky(model, rule, record)
+    row = {"method": name, "completed": r["failure"] is None, "failure": r["failure"] or "",
+           **{f"blocks_{f}": r["count"][f] for f in FORMAT_NAMES}, **{f"share_{f}_%": 100 * r["count"][f] / n_off for f in FORMAT_NAMES},
+           "stored_factor_MB": r["bytes"] / 1e6, "stored_factor_GB": r["bytes"] / 1e9, "reduction_vs_fp64_%": 100 * (1 - r["bytes"] / fp64_bytes),
+           "global_error_sqrt_sum_d2": np.sqrt(r["used"]), "error_over_tau_m": np.sqrt(r["used"]) / (TAU * model.m),
+           "budget_used_%": 100 * r["used"] / budget, "within_budget": r["used"] <= budget, "factorization_time_s": r["time"]}
+    if r["failure"] is None:
+        t0 = time.time()
+        nll, sigma2 = negative_log_likelihood_from_factor(model, r)
+        row["negative_log_likelihood"] = nll
+        if args.test_strides > 0:
+            mean, sd = predict(model, r["L"], F_test, sigma2)
+            if "pred_mean" not in baseline:
+                baseline["pred_mean"], baseline["nll"], baseline["bytes"] = mean, nll, r["bytes"]
+            row["max_prediction_difference_vs_A_BW"] = float(np.max(np.abs(scale[:, None, None] * (mean - baseline["pred_mean"]))))
+        elif "nll" not in baseline:
+            baseline["nll"], baseline["bytes"] = nll, r["bytes"]
+        row["nll_minus_A"] = nll - baseline["nll"]
+        row["reduction_vs_A_%"] = 100 * (1 - r["bytes"] / baseline["bytes"])
+        row["scoring_time_s"] = time.time() - t0
+        if args.verify_dense:
+            dn, lam_min, lam_min_tilde = dense_check(model, r)
+            row.update(dense_frobenius_norm=dn, dense_over_tracked=dn / np.sqrt(r["used"]) if r["used"] > 0 else np.nan, lambda_min_Sigma=lam_min, lambda_min_Sigma_tilde=lam_min_tilde)
+    results[name] = {k: r[k] for k in ("count", "precision", "used", "bytes", "time", "failure")}
+    assignments = pd.DataFrame(r["assignments"]).assign(method=name)
+    del r
+    gc.collect()
+    print(f"{name:26s} blocks {'/'.join(str(row[f'blocks_{f}']) for f in FORMAT_NAMES)}  stored {row['stored_factor_GB']:.3f} GB  error {row['error_over_tau_m']:.4f} tau m  "
+          f"[{row['factorization_time_s']:.0f} s factorization, {row.get('scoring_time_s', 0):.0f} s scoring]", flush=True)
+    return row, assignments
+
+
+costs = {}
+all_assignments = []
+if args.reference:
+    row, asg = evaluate("fp64 reference", type("AllFp64", (), {"name": "fp64", "choose": staticmethod(lambda i, k, err, d2, finite, norm_kk: "fp64")})(), record=costs)
+    rows.append(row); all_assignments.append(asg)
+row, asg = evaluate("A: per-block budget", PerBlockRule(model.m, nB, n_off), record=None if args.reference else costs)
+rows.append(row); all_assignments.append(asg)
+row, asg = evaluate("B-greedy: global budget", GlobalGreedy(model.m, nB, n_off)); rows.append(row); all_assignments.append(asg)
+row, asg = evaluate("B-paced: global budget", GlobalPaced(model.m, nB, n_off)); rows.append(row); all_assignments.append(asg)
 t_plan = time.time()
-plan, planned_used = plan_optimal(reference_costs, sizes, (TAU * model.m)**2)
+plan, planned_used = plan_optimal(costs, sizes, budget)
 t_plan = time.time() - t_plan
 planned_rule = GlobalPlanned(model.m, nB, n_off, plan)
-results["B-optimal: global budget"] = mixed_precision_cholesky(model, planned_rule)
-results["B-optimal: global budget"]["plan_count"] = {name: sum(1 for v in plan.values() if v == name) for name in FORMAT_NAMES}
-results["B-optimal: global budget"]["plan_used"] = planned_used
-results["B-optimal: global budget"]["fallbacks"] = planned_rule.fallbacks
-results["B-optimal: global budget"]["time_pass1"] = results["fp64 reference"]["time"] + t_plan
+row, asg = evaluate("B-optimal: global budget", planned_rule)
+row.update({f"planned_{f}": sum(1 for v in plan.values() if v == f) for f in FORMAT_NAMES}, planned_budget_used_pct=100 * planned_used / budget,
+           fallbacks_in_pass2=planned_rule.fallbacks, planning_time_s=t_plan, costs_from="fp64 reference" if args.reference else "A: per-block budget")
+rows.append(row); all_assignments.append(asg)
 
 # ----------------------------------------------------------------------------- report
 
-fp64_bytes = results["fp64 reference"]["bytes"]                                  # the same blocks, all stored in fp64 (diagonal blocks as full squares)
-ref_nll, ref_sigma2 = negative_log_likelihood_from_factor(model, results["fp64 reference"])
-ref_mean, ref_sd = predict(model, results["fp64 reference"]["L"], F_test, ref_sigma2)                  # (3, test strides, 101), standardized
-budget = (TAU * model.m)**2
-rows = []
-for name, r in results.items():
-    nll, sigma2 = negative_log_likelihood_from_factor(model, r) if r["failure"] is None else (np.nan, np.nan)
-    if r["failure"] is None:
-        mean, sd = predict(model, r["L"], F_test, sigma2)
-        pred_diff = float(np.max(np.abs(scale[:, None, None] * (mean - ref_mean))))
-    else:
-        pred_diff = np.nan
-    row = {"method": name, "completed": r["failure"] is None, "failure": r["failure"] or "",
-           **{f"blocks_{f}": r["count"][f] for f in FORMAT_NAMES}, **{f"share_{f}_%": 100 * r["count"][f] / n_off for f in FORMAT_NAMES},
-           "stored_factor_MB": r["bytes"] / 1e6, "reduction_vs_fp64_%": 100 * (1 - r["bytes"] / fp64_bytes),
-           "reduction_vs_A_%": 100 * (1 - r["bytes"] / results["A: per-block budget"]["bytes"]),
-           "global_error_sqrt_sum_d2": np.sqrt(r["used"]), "error_over_tau_m": np.sqrt(r["used"]) / (TAU * model.m),
-           "budget_used_%": 100 * r["used"] / budget, "within_budget": r["used"] <= budget,
-           "factorization_time_s": r["time"], "negative_log_likelihood": nll, "nll_minus_fp64": nll - ref_nll,
-           "max_prediction_difference_vs_fp64_BW": pred_diff}
-    if "plan_count" in r:
-        row.update({f"planned_{f}": r["plan_count"][f] for f in FORMAT_NAMES}, planned_budget_used_pct=100 * r["plan_used"] / budget,
-                   fallbacks_in_pass2=r["fallbacks"], reference_pass_time_s=r["time_pass1"])
-    if args.verify_dense and r["failure"] is None:
-        dn, lam_min, lam_min_tilde = dense_check(model, r)
-        row.update(dense_frobenius_norm=dn, dense_over_tracked=dn / np.sqrt(r["used"]) if r["used"] > 0 else np.nan, lambda_min_Sigma=lam_min, lambda_min_Sigma_tilde=lam_min_tilde)
-    rows.append(row)
 table = pd.DataFrame(rows).set_index("method")
 table.to_csv(os.path.join(args.out, "mixed_precision_budget_comparison.csv"))
-pd.concat([pd.DataFrame(r["assignments"]).assign(method=name) for name, r in results.items()]).to_csv(os.path.join(args.out, "mixed_precision_budget_blocks.csv"), index=False)
-
+pd.concat(all_assignments).to_csv(os.path.join(args.out, "mixed_precision_budget_blocks.csv"), index=False)
 shown = pd.DataFrame({
-    "blocks bf16 / fp32 / fp64": [" / ".join(str(r["count"][f]) for f in FORMAT_NAMES) for r in results.values()],
-    "bf16 share [%]": [f"{100 * r['count']['bf16'] / n_off:.1f}" for r in results.values()],
-    "stored factor [MB]": [f"{r['bytes'] / 1e6:.3f}" for r in results.values()],
-    "reduction vs fp64 [%]": [f"{100 * (1 - r['bytes'] / fp64_bytes):.1f}" for r in results.values()],
-    "reduction vs A [%]": [f"{100 * (1 - r['bytes'] / results['A: per-block budget']['bytes']):.1f}" for r in results.values()],
-    "error / (tau m)": [f"{np.sqrt(r['used']) / (TAU * model.m):.4f}" for r in results.values()],
-    "budget used [%]": [f"{100 * r['used'] / budget:.2f}" for r in results.values()],
-    "time [s]": [f"{r['time']:.2f}" for r in results.values()],
-    "completed": ["yes" if r["failure"] is None else "no" for r in results.values()],
-    "nll - nll(fp64)": [f"{table.loc[name, 'nll_minus_fp64']:+.4f}" for name in results],
+    "blocks bf16 / fp32 / fp64": [" / ".join(str(results[n]["count"][f]) for f in FORMAT_NAMES) for n in results],
+    "bf16 share [%]": [f"{100 * results[n]['count']['bf16'] / n_off:.1f}" for n in results],
+    "stored factor [GB]": [f"{results[n]['bytes'] / 1e9:.3f}" for n in results],
+    "reduction vs fp64 [%]": [f"{100 * (1 - results[n]['bytes'] / fp64_bytes):.1f}" for n in results],
+    "reduction vs A [%]": [f"{table.loc[n, 'reduction_vs_A_%']:.1f}" for n in results],
+    "error / (tau m)": [f"{np.sqrt(results[n]['used']) / (TAU * model.m):.4f}" for n in results],
+    "budget used [%]": [f"{100 * results[n]['used'] / budget:.2f}" for n in results],
+    "time [s]": [f"{results[n]['time']:.1f}" for n in results],
+    "completed": ["yes" if results[n]["failure"] is None else "no" for n in results],
+    "nll - nll(A)": [f"{table.loc[n, 'nll_minus_A']:+.4f}" for n in results],
 }, index=list(results))
-print(f"\nfp64 factor {fp64_bytes / 1e6:.3f} MB as stored ({nB} full diagonal blocks and {n_off} off-diagonal blocks; {N * (N + 1) / 2 * 8 / 1e6:.3f} MB as a packed triangle); negative log likelihood with the fp64 factor {ref_nll:,.3f}")
+print(f"\nfp64 factor would be {fp64_bytes / 1e9:.3f} GB as stored ({nB} full diagonal blocks and {n_off} off-diagonal blocks; {N * (N + 1) / 2 * 8 / 1e9:.3f} GB as a packed triangle)")
 print(shown.to_string())
-r = results["B-optimal: global budget"]
-print(f"\nB-optimal plan from the reference costs: bf16 / fp32 / fp64 = {' / '.join(str(r['plan_count'][f]) for f in FORMAT_NAMES)}, "
-      f"planned budget use {100 * r['plan_used'] / budget:.2f} %, fallbacks in the second pass {r['fallbacks']}, reference pass {r['time_pass1']:.2f} s")
+r = table.loc["B-optimal: global budget"]
+print(f"\nB-optimal plan from the costs recorded in the run of {r['costs_from']}: bf16 / fp32 / fp64 = {int(r['planned_bf16'])} / {int(r['planned_fp32'])} / {int(r['planned_fp64'])}, "
+      f"planned budget use {r['planned_budget_used_pct']:.2f} %, fallbacks in the second pass {int(r['fallbacks_in_pass2'])}, planning {r['planning_time_s']:.1f} s")
 if args.verify_dense:
     print("\ndense verification (forms L~ L~^T - Sigma; for checking only)")
     print(table[["dense_frobenius_norm", "global_error_sqrt_sum_d2", "dense_over_tracked", "lambda_min_Sigma", "lambda_min_Sigma_tilde"]].to_string(float_format=lambda v: f"{v:.4e}"))
-a = pd.DataFrame(results["fp64 reference"]["assignments"])
-print(f"\nreference costs d^2 of the off-diagonal blocks: bf16 median {a['d2_bf16'].median():.3e}, min {a['d2_bf16'].min():.3e}, max {a['d2_bf16'].max():.3e};  "
+a = all_assignments[0 if not args.reference else 0]
+print(f"\ncosts d^2 of the off-diagonal blocks in the first run: bf16 median {a['d2_bf16'].median():.3e}, min {a['d2_bf16'].min():.3e}, max {a['d2_bf16'].max():.3e};  "
       f"fp32 median {a['d2_fp32'].median():.3e}, max {a['d2_fp32'].max():.3e};  global budget {budget:.3e}")
 print("The guarantee assumes exact fp64 arithmetic and storage; the implementation runs in finite-precision fp64, whose rounding is not covered by the bound.")
 
@@ -578,7 +596,7 @@ fig, axes = plt.subplots(1, len(names), figsize=(4.6 * len(names), 5.6), constra
 for ax, name in zip(axes, names):
     r = results[name]
     ax.imshow(np.ma.masked_invalid(r["precision"]), cmap=cmap, norm=norm, origin="upper", interpolation="nearest")
-    ax.set_title(f"{name}\n" + "   ".join(f"{f} {100 * r['count'][f] / n_off:.0f}%" for f in FORMAT_NAMES) + f"\n{r['bytes'] / 1e6:.2f} MB, error {np.sqrt(r['used']) / (TAU * model.m):.2f} tau m", fontsize=10)
+    ax.set_title(f"{name}\n" + "   ".join(f"{f} {100 * r['count'][f] / n_off:.0f}%" for f in FORMAT_NAMES) + f"\n{r['bytes'] / 1e9:.3f} GB, error {np.sqrt(r['used']) / (TAU * model.m):.2f} tau m", fontsize=10)
     ax.set_xlabel("block column $k$")
 axes[0].set_ylabel("block row $i$")
 fig.legend(handles=[Patch(facecolor=PRECISION_COLORS[f], label=f) for f in FORMAT_NAMES], loc="lower center", ncol=3, frameon=False, bbox_to_anchor=(0.5, -0.08))
@@ -598,7 +616,7 @@ for f in FORMAT_NAMES:
 ax.set_xticks(range(len(names))); ax.set_xticklabels([n.replace(": ", "\n") for n in names], fontsize=9)
 ax.set_ylabel("off-diagonal factor blocks [%]"); ax.set_ylim(0, 112); ax.set_yticks(range(0, 101, 20)); ax.legend(frameon=False, ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.18))
 for x, n in enumerate(names):
-    ax.text(x, 102, f"{results[n]['bytes'] / 1e6:.2f} MB", ha="center", va="bottom", fontsize=9)
+    ax.text(x, 102, f"{results[n]['bytes'] / 1e9:.3f} GB", ha="center", va="bottom", fontsize=9)
 ax.set_title("Precision mix of the stored Cholesky factor, with the stored size above each bar", loc="left", pad=10)
 fig.savefig(os.path.join(args.out, "mixed_precision_budget_precision_mix.png"), dpi=200, bbox_inches="tight")
 plt.close(fig)
